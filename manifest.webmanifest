@@ -1,0 +1,14 @@
+{
+  "name": "SynthVis — Synthetic Vision",
+  "short_name": "SynthVis",
+  "description": "Garmin-style synthetic vision terrain display over French IGN elevation data.",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "landscape",
+  "background_color": "#05070c",
+  "theme_color": "#05070c",
+  "icons": [
+    { "src": "./icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any maskable" }
+  ]
+}

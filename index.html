@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#05070c">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="mobile-web-app-capable" content="yes">
+<title>SynthVis — Synthetic Vision</title>
+<link rel="manifest" href="./manifest.webmanifest">
+<link rel="stylesheet" href="./style.css">
+</head>
+<body>
+<div id="app">
+  <canvas id="view"></canvas>
+  <canvas id="hud"></canvas>
+
+  <!-- simulator touch controls -->
+  <div id="simControls">
+    <div id="stick" title="drag to fly"></div>
+    <div id="throttle">
+      <button id="thrUp" class="thr">＋</button>
+      <button id="thrDn" class="thr">－</button>
+    </div>
+    <button id="pauseBtn" class="pause">❚❚</button>
+  </div>
+
+  <div id="topbar">
+    <button id="menuBtn" class="icon">☰</button>
+    <div id="stat">starting…</div>
+  </div>
+
+  <!-- settings drawer -->
+  <aside id="panel">
+    <div class="panel-head">
+      <strong>SynthVis</strong>
+      <button id="closeBtn" class="icon">✕</button>
+    </div>
+
+    <label class="lbl">Mode</label>
+    <div class="seg">
+      <button data-mode="sim" class="on">Simulator</button>
+      <button data-mode="gps">GPS</button>
+      <button data-mode="ar">GPS + IMU</button>
+    </div>
+    <button id="useHere" class="wide hidden">Jump to my location ▸</button>
+
+    <div id="simControls2">
+      <label class="lbl">Location preset</label>
+      <select id="preset"></select>
+    </div>
+
+    <label class="lbl">Visual style</label>
+    <div class="seg">
+      <button data-style="relief" class="on">Relief</button>
+      <button data-style="aviation">Aviation</button>
+    </div>
+
+    <label class="lbl">Look-ahead range</label>
+    <div class="seg">
+      <button data-range="15000">15 km</button>
+      <button data-range="30000">30 km</button>
+      <button data-range="45000" class="on">45 km</button>
+      <button data-range="80000">80 km</button>
+    </div>
+
+    <label class="lbl">Mesh quality</label>
+    <div class="seg">
+      <button data-quality="low">Low</button>
+      <button data-quality="med" class="on">Medium</button>
+      <button data-quality="high">High</button>
+    </div>
+
+    <label class="lbl">Units</label>
+    <div class="seg">
+      <button data-units="aero" class="on">ft / kt</button>
+      <button data-units="metric">m / km/h</button>
+    </div>
+
+    <label class="lbl">Field of view <span id="fovVal">60°</span></label>
+    <input id="fov" type="range" min="35" max="95" value="60">
+
+    <label class="lbl">GPS altitude offset <span id="altOffVal">+0 m</span></label>
+    <input id="altOff" type="range" min="-100" max="100" value="0">
+
+    <div class="row"><label><input id="taws" type="checkbox"> Terrain colouring (TAWS)</label></div>
+    <div class="row"><label><input id="summits" type="checkbox" checked> Name major summits</label></div>
+    <div class="row"><label><input id="grid" type="checkbox"> Lat/Lon grid</label></div>
+    <div class="row"><label><input id="hudOn" type="checkbox" checked> Flight instruments</label></div>
+
+    <label class="lbl">Offline cache</label>
+    <button id="preloadBtn" class="wide">Preload this area</button>
+    <button id="clearBtn" class="wide ghost">Clear cached tiles</button>
+
+    <p class="fine">Elevation © IGN / Géoplateforme (RGE ALTI + SRTM). Free, no key.
+      Terrain is advisory — not for navigation.</p>
+  </aside>
+
+  <!-- start / permission gate -->
+  <div id="start">
+    <div id="startCard" class="card">
+      <h1>SynthVis</h1>
+      <p class="sub">Garmin-style synthetic vision over real French terrain.</p>
+      <ul class="feat">
+        <li>Shaded 3D elevation from IGN open data</li>
+        <li>Fly the simulator, or use your phone's GPS &amp; motion sensors</li>
+        <li>Works offline once an area is cached</li>
+      </ul>
+      <button id="startBtn" class="go">Start ▸</button>
+      <p class="fine">Best on iPhone in landscape. Add to Home Screen for full-screen.</p>
+    </div>
+  </div>
+
+  <div id="toast"></div>
+</div>
+<script type="module" src="./js/main.js"></script>
+</body>
+</html>
