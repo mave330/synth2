@@ -146,11 +146,19 @@ export class TerrainMesh {
     this.origin.lon = this.base.lon + ox / mLon;
     this.origin.valid = true;
 
+    // Fallback height for vertices whose DEM tile hasn't loaded yet. Holding
+    // the terrain height under the aircraft (not 0) means not-yet-loaded areas
+    // sit at a plausible altitude and blend in, instead of dropping to sea
+    // level and showing as flat blue plates far below the mountains.
+    let seed = dem.sample(lat, lon, 0);
+    if (!(seed === seed)) seed = (this._seed !== undefined ? this._seed : 0);
+    this._seed = seed;
+
     const P = this.positions, VPL = this.VPL;
     for (let k = 0; k < L; k++) {
       const sk = this.s0 * (1 << k), dl = this._demLevel(k);
       const cx = this._cx[k], cy = this._cy[k];
-      let lastGood = 0;
+      let lastGood = seed;
       for (let j = 0; j <= m; j++) {
         const wy = cy + (j - m / 2) * sk, ly = wy - oy, latv = this.base.lat + wy / mLat;
         for (let i = 0; i <= m; i++) {
@@ -194,14 +202,21 @@ export class TerrainMesh {
   // any hairline crack against the next-coarser ring behind it.
   _buildSkirts() {
     const P = this.positions, N = this.normals, m = this.m, L = this.L;
+    // Outward horizontal direction per edge (south,north,west,east). The skirt
+    // is a vertical wall, so its normal is horizontal-outward, tilted slightly
+    // down — that shades it as a recessed cliff/shadow rather than a bright
+    // flat facet (copying the top vertex's up-normal made skirts flash white).
+    const OUT = [[0, -1], [0, 1], [-1, 0], [1, 0]];
+    const NZ = -0.45, NL = Math.hypot(1, NZ);
     for (let k = 0; k < L; k++) {
       const depth = Math.min(500, Math.max(80, this.s0 * (1 << k) * 2));
       for (let edge = 0; edge < 4; edge++) {
+        const nx = OUT[edge][0] / NL, ny = OUT[edge][1] / NL, nz = NZ / NL;
         for (let t = 0; t <= m; t++) {
           const go = this._boundaryG(k, edge, t) * 3;
           const so = this._skirtV(k, edge, t) * 3;
           P[so] = P[go]; P[so + 1] = P[go + 1]; P[so + 2] = P[go + 2] - depth;
-          N[so] = N[go]; N[so + 1] = N[go + 1]; N[so + 2] = N[go + 2];
+          N[so] = nx; N[so + 1] = ny; N[so + 2] = nz;
         }
       }
     }

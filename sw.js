@@ -4,7 +4,7 @@
 // DEM tiles are separately persisted in IndexedDB by dem.js; here we also
 // runtime-cache the WMS responses so a hard reload after a flight still has them.
 
-const SHELL = 'synthvis-shell-v7';
+const SHELL = 'synthvis-shell-v8';
 const TILES = 'synthvis-wms-v1';
 const APP = [
   './', './index.html', './style.css', './manifest.webmanifest',
