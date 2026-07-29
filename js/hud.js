@@ -6,7 +6,7 @@
 // conformal with the 3D scene — the same vertical FOV is used for both, so a
 // 10 deg ladder line lands exactly on terrain 10 deg below the nose.
 
-import { DEG, RAD, normDeg, clamp, FT, KT, KMH } from './geo.js';
+import { DEG, RAD, normDeg, diffDeg, clamp, FT, KT, KMH } from './geo.js';
 
 const WHITE = '#f2f5f8';
 const AMBER = '#ffcc33';
@@ -51,6 +51,7 @@ export class Hud {
     this._rollScale(s);
     this._aircraft();
     this._fpm(s, opt);
+    this._airports(opt.airports);
     this._summits(opt.labels);
     this._speedTape(s);
     this._altTape(s);
@@ -58,6 +59,39 @@ export class Hud {
     this._dataBlock(s, opt);
     this._overflying(opt.overflying);
     this._alert(opt);
+  }
+
+  // ICAO tags over the runways drawn in the 3D scene, Garmin-style cyan.
+  _airports(list) {
+    if (!list || !list.length) return;
+    const ctx = this.ctx, u = this.u;
+    const metric = this.units === 'metric';
+    ctx.textAlign = 'center';
+    for (const a of list) {
+      ctx.globalAlpha = a.alpha;
+      ctx.strokeStyle = CYAN; ctx.fillStyle = CYAN;
+      ctx.lineWidth = Math.max(1, 0.2 * u);
+      // small upward leader off the field
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(a.x, a.y - 2.2 * u); ctx.stroke();
+      const dist = metric ? `${(a.d / 1000).toFixed(1)} km` : `${(a.d / 1852).toFixed(1)} NM`;
+      ctx.font = `700 ${(2.0 * u).toFixed(1)}px ui-monospace, Menlo, monospace`;
+      const bw = Math.max(ctx.measureText(a.c).width, ctx.measureText(dist).width) + 1.4 * u;
+      const bx = clamp(a.x - bw / 2, 1 * u, this.w - bw - 1 * u);
+      const ty = a.y - 2.2 * u;
+      ctx.globalAlpha = a.alpha * 0.8;
+      ctx.fillStyle = 'rgba(4,18,26,0.62)';
+      ctx.fillRect(bx, ty - 4.2 * u, bw, 4.4 * u);
+      ctx.globalAlpha = a.alpha;
+      ctx.fillStyle = CYAN;
+      ctx.textAlign = 'left';
+      ctx.fillText(a.c, bx + 0.7 * u, ty - 2.8 * u);
+      ctx.font = `600 ${(1.7 * u).toFixed(1)}px ui-monospace, Menlo, monospace`;
+      ctx.fillStyle = 'rgba(150,225,255,0.95)';
+      ctx.fillText(dist, bx + 0.7 * u, ty - 0.9 * u);
+      ctx.textAlign = 'center';
+    }
+    ctx.globalAlpha = 1;
+    ctx.font = `600 ${(2.6 * u).toFixed(1)}px ui-monospace, Menlo, monospace`;
   }
 
   // --- named summits, projected onto the peaks in the 3D view --------------
@@ -148,13 +182,15 @@ export class Hud {
     ctx.strokeStyle = WHITE; ctx.fillStyle = WHITE;
     ctx.textAlign = 'right';
 
-    // Horizon line
+    // Zero-pitch (horizon) line, with the heading tick marks Garmin SVT and
+    // Dynon SynVis put along it — they tie the attitude picture to the compass.
     const y0 = yFor(0);
     if (Math.abs(y0) < h * 2.5) {
-      ctx.globalAlpha = 0.9;
+      ctx.globalAlpha = 0.92;
       ctx.lineWidth = Math.max(1.4, 0.32 * u);
       ctx.beginPath(); ctx.moveTo(-w * 0.9, y0); ctx.lineTo(w * 0.9, y0); ctx.stroke();
       ctx.lineWidth = Math.max(1, 0.25 * u);
+      if (opt.zeroPitchHeadings !== false) this._zeroPitchHeadings(s, y0);
     }
 
     ctx.globalAlpha = 0.85;
@@ -186,6 +222,36 @@ export class Hud {
     }
     ctx.globalAlpha = 1;
     ctx.restore();
+  }
+
+  // Heading ticks along the zero-pitch line. Drawn inside the ladder's rolled
+  // frame, and conformal: a tick sits exactly over the compass direction it
+  // names, so terrain features line up with their bearing.
+  _zeroPitchHeadings(s, y0) {
+    const ctx = this.ctx, u = this.u;
+    const hd = normDeg(s.heading);
+    const first = Math.ceil((hd - 55) / 10) * 10;
+    ctx.textAlign = 'center';
+    for (let d = first; d <= hd + 55; d += 10) {
+      const delta = diffDeg(d, hd);
+      if (Math.abs(delta) > 55) continue;
+      const x = this.pxPerRad * Math.tan(delta * DEG);
+      const major = ((d % 30) + 30) % 30 === 0;
+      ctx.globalAlpha = 0.9;
+      ctx.beginPath();
+      ctx.moveTo(x, y0);
+      ctx.lineTo(x, y0 - (major ? 2.4 : 1.3) * u);
+      ctx.stroke();
+      if (major) {
+        const dd = normDeg(d);
+        const lbl = dd === 0 ? 'N' : dd === 90 ? 'E' : dd === 180 ? 'S' : dd === 270 ? 'W'
+          : String(dd / 10);
+        ctx.font = `600 ${(1.9 * u).toFixed(1)}px ui-monospace, Menlo, monospace`;
+        ctx.fillText(lbl, x, y0 - 4.0 * u);
+        ctx.font = `600 ${(2.6 * u).toFixed(1)}px ui-monospace, Menlo, monospace`;
+      }
+    }
+    ctx.globalAlpha = 1;
   }
 
   // --- roll scale (fixed) + pointer (rides with the horizon) --------------

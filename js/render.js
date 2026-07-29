@@ -67,6 +67,7 @@ uniform vec3  uHorizon;      // haze colour terrain fades into
 uniform vec2  uGeoScale;     // metres per degree: (lon, lat)
 uniform vec2  uGeoOrigin;    // (lon0, lat0) of the mesh origin
 uniform float uGrid;         // grid spacing in degrees, 0 = off
+uniform float uWire;         // SVT terrain lattice spacing in degrees, 0 = off
 uniform float uTaws;         // 0 = plain relief, 1 = TAWS colouring
 uniform float uRefAlt;       // altitude the TAWS bands are measured from
 uniform float uStyle;        // 0 = aviation hypsometric, 1 = PeakFinder relief
@@ -111,10 +112,12 @@ void main(){
   vec3 base = peak ? relief(elev) : hypso(elev);
 
   // --- TAWS bands, relative to the aircraft ------------------------------
+  // Tint rather than replace: Garmin/Dynon keep the hillshade readable through
+  // the caution/warning colour, so you can still see the shape of the threat.
   if (uTaws > 0.5) {
     float rel = elev - uRefAlt;
-    if (rel > -30.0)        base = mix(base, vec3(0.78,0.10,0.10), 0.80);  // < 100 ft below
-    else if (rel > -305.0)  base = mix(base, vec3(0.85,0.72,0.08), 0.70);  // < 1000 ft below
+    if (rel > -30.0)        base = mix(base, vec3(0.72,0.11,0.11), 0.62);  // < 100 ft below
+    else if (rel > -305.0)  base = mix(base, vec3(0.80,0.68,0.10), 0.50);  // < 1000 ft below
   }
 
   // --- shading ------------------------------------------------------------
@@ -130,6 +133,19 @@ void main(){
     c = base * (0.30 * sky + 0.85 * lam);
     // Sharpen ridges a little: rim highlight on slopes facing the sun edge-on.
     c += base * 0.12 * pow(1.0 - abs(n.z), 3.0);
+  }
+
+  // --- SVT terrain lattice -----------------------------------------------
+  // The fine dark mesh Garmin/Dynon draw over synthetic terrain: it's what
+  // makes slope and distance readable on an otherwise flat-shaded surface.
+  if (uWire > 0.0) {
+    vec2 ll = uGeoOrigin + vec2(vPos.x / uGeoScale.x, vPos.y / uGeoScale.y);
+    vec2 g  = ll / uWire;
+    vec2 w  = fwidth(g);
+    vec2 f  = abs(fract(g - 0.5) - 0.5) / max(w, vec2(1e-6));
+    float line = 1.0 - min(min(f.x, f.y), 1.0);
+    line *= smoothstep(1.9, 0.8, max(w.x, w.y));   // fade out before it aliases
+    c *= mix(1.0, 0.66, line * 0.85);
   }
 
   // --- lat/lon reference grid --------------------------------------------
@@ -154,6 +170,38 @@ void main(){
   frag = vec4(c, 1.0);
   // Logarithmic depth: keeps 60 m foreground and 45 km ridges both crisp even
   // on a 16-bit depth buffer.
+  gl_FragDepth = log2(vLogZ) * uFcoef * 0.5;
+}`;
+
+// Flat-coloured geometry laid on the terrain (runways). Shares the terrain's
+// logarithmic depth and haze so it sits in the scene correctly.
+const OVL_VS = `#version 300 es
+precision highp float;
+layout(location=0) in vec3 aPos;
+layout(location=1) in vec4 aCol;
+uniform mat4 uMVP;
+out vec4 vCol;
+out float vLogZ;
+out float vDist;
+void main(){
+  gl_Position = uMVP * vec4(aPos, 1.0);
+  vLogZ = 1.0 + gl_Position.w;
+  vCol = aCol;
+  vDist = length(aPos.xy);
+}`;
+
+const OVL_FS = `#version 300 es
+precision highp float;
+in vec4 vCol;
+in float vLogZ;
+in float vDist;
+uniform float uFcoef;
+uniform float uFar;
+uniform vec3 uHorizon;
+out vec4 frag;
+void main(){
+  float fog = 1.0 - exp(-pow(vDist / (uFar * 0.62), 2.2));
+  frag = vec4(mix(vCol.rgb, uHorizon, clamp(fog, 0.0, 1.0)), vCol.a);
   gl_FragDepth = log2(vLogZ) * uFcoef * 0.5;
 }`;
 
@@ -193,6 +241,22 @@ export class Renderer {
     this.skyU = uniforms(gl, this.skyProg);
     this.terProg = link(gl, TERRAIN_VS, TERRAIN_FS);
     this.terU = uniforms(gl, this.terProg);
+    this.ovlProg = link(gl, OVL_VS, OVL_FS);
+    this.ovlU = uniforms(gl, this.ovlProg);
+
+    // Runway overlay: interleaved pos(3) + rgba(4).
+    this.ovlVao = gl.createVertexArray();
+    this.ovlVbo = gl.createBuffer();
+    gl.bindVertexArray(this.ovlVao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.ovlVbo);
+    gl.enableVertexAttribArray(0);
+    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 28, 0);
+    gl.enableVertexAttribArray(1);
+    gl.vertexAttribPointer(1, 4, gl.FLOAT, false, 28, 12);
+    gl.bindVertexArray(null);
+    this.ovlTriCount = 0;
+    this.ovlLineStart = 0;
+    this.ovlLineCount = 0;
 
     this.vao = gl.createVertexArray();
     this.vboPos = gl.createBuffer();
@@ -213,9 +277,12 @@ export class Renderer {
     // Two looks. 'relief' is the PeakFinder-style pale, hazy panorama; sky
     // colours change with it so distant ridges fade into a matching horizon.
     this.palettes = {
-      aviation: { zenith: [0.13, 0.30, 0.62], horizon: [0.62, 0.74, 0.86], haze: [0.30, 0.33, 0.33] },
+      // Deeper, more saturated blue and a hazier blue-grey terrain fade: the
+      // Garmin SVT / Dynon SynVis sky.
+      aviation: { zenith: [0.04, 0.19, 0.55], horizon: [0.44, 0.63, 0.85], haze: [0.50, 0.57, 0.62] },
       relief:   { zenith: [0.36, 0.55, 0.78], horizon: [0.85, 0.89, 0.93], haze: [0.80, 0.85, 0.89] },
     };
+    this.wire = 0;
     this.style = 'relief';
     this.sky = this.palettes.relief;
 
@@ -228,6 +295,23 @@ export class Renderer {
   setStyle(style) {
     this.style = style;
     this.sky = this.palettes[style] || this.palettes.relief;
+  }
+
+  /**
+   * Upload runway overlay geometry: `tris` then `lines`, each a flat array of
+   * [x,y,z, r,g,b,a] per vertex in the mesh's local ENU frame.
+   */
+  setOverlay(tris, lines) {
+    const gl = this.gl;
+    const n = tris.length + lines.length;
+    this.ovlTriCount = tris.length / 7;
+    this.ovlLineStart = this.ovlTriCount;
+    this.ovlLineCount = lines.length / 7;
+    if (!n) return;
+    const buf = new Float32Array(n);
+    buf.set(tris, 0); buf.set(lines, tris.length);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.ovlVbo);
+    gl.bufferData(gl.ARRAY_BUFFER, buf, gl.DYNAMIC_DRAW);
   }
 
   /** Upload a rebuilt TerrainMesh. */
@@ -322,10 +406,23 @@ export class Renderer {
     gl.uniform1f(this.terU['uTaws'], this.taws ? 1 : 0);
     gl.uniform1f(this.terU['uStyle'], this.style === 'relief' ? 1 : 0);
     gl.uniform1f(this.terU['uGrid'], this.grid);
+    gl.uniform1f(this.terU['uWire'], this.wire);
     gl.uniform3fv(this.terU['uHorizon'], this.sky.horizon);
     gl.uniform2f(this.terU['uGeoScale'], geo.mLon, geo.mLat);
     gl.uniform2f(this.terU['uGeoOrigin'], geo.lon0, geo.lat0);
     gl.drawElements(gl.TRIANGLES, this.indexCount, this.indexType, 0);
+
+    // Runways, laid on top of the terrain.
+    if (this.ovlTriCount || this.ovlLineCount) {
+      gl.useProgram(this.ovlProg);
+      gl.bindVertexArray(this.ovlVao);
+      gl.uniformMatrix4fv(this.ovlU['uMVP'], false, this.mvp);
+      gl.uniform1f(this.ovlU['uFcoef'], fcoef);
+      gl.uniform1f(this.ovlU['uFar'], far);
+      gl.uniform3fv(this.ovlU['uHorizon'], this.sky.horizon);
+      if (this.ovlTriCount) gl.drawArrays(gl.TRIANGLES, 0, this.ovlTriCount);
+      if (this.ovlLineCount) gl.drawArrays(gl.LINES, this.ovlLineStart, this.ovlLineCount);
+    }
     gl.bindVertexArray(null);
   }
 }

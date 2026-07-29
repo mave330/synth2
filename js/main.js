@@ -7,6 +7,7 @@ import { Renderer } from './render.js';
 import { Hud } from './hud.js';
 import { NavState, Simulator, GpsSource, DeviceAttitude, PRESETS } from './nav.js';
 import { SUMMITS, nearestSummit } from './summits.js';
+import { nearbyAirports } from './airports.js';
 
 const $ = id => document.getElementById(id);
 
@@ -25,8 +26,9 @@ const cfg = {
   taws: false,
   grid: false,
   summits: true,
+  runways: true,
   fov: 60,
-  style: 'relief',       // 'relief' (PeakFinder-like) | 'aviation'
+  style: 'aviation',     // 'aviation' (Garmin/Dynon SVT) | 'relief' (PeakFinder-like)
 };
 
 const dem = new DemCache();
@@ -133,8 +135,11 @@ function frame(t) {
     state.alt,
   ];
 
+  buildRunways(false);
+
   renderer.taws = cfg.taws;
   renderer.grid = cfg.grid ? gridStepFor(cfg.range) : 0;
+  renderer.wire = cfg.style === 'aviation' ? wireStepFor(cfg.range) : 0;
   renderer.fovDeg = cfg.fov;
   renderer.draw({ eye, heading: state.heading, pitch: state.pitch, roll: state.roll,
                   refAlt: state.alt },
@@ -147,6 +152,8 @@ function frame(t) {
   hud.units = cfg.units;
   hud.draw(state, {
     fovDeg: cfg.fov, agl: aglNow, alert, labels,
+    airports: airportLabels(eye, mLat, mLon),
+    zeroPitchHeadings: cfg.style === 'aviation',
     overflying: cfg.summits && of ? of.summit : null,
     status: cfg.mode === 'sim' ? 'SIM'
       : (gps.ok ? (cfg.mode === 'ar' ? 'GPS+IMU' : 'GPS') : 'NO FIX'),
@@ -160,17 +167,94 @@ function gridStepFor(range) {
   return range > 60000 ? 0.1 : range > 25000 ? 0.05 : 0.01;
 }
 
+// SVT lattice: finer than the reference grid — roughly a 1-2 km mesh.
+function wireStepFor(range) {
+  return range > 60000 ? 0.02 : range > 25000 ? 0.01 : 0.005;
+}
+
 // Switch the terrain look. Relief (PeakFinder-like) turns the aviation overlays
 // off by default for a clean panorama; both stay user-toggleable afterwards.
 function applyStyle(s) {
   cfg.style = s;
   renderer.setStyle(s);
+  // SVT mode brings the aviation overlays with it; the lat/lon grid stays off
+  // because the finer SVT lattice already carries the terrain texture.
   cfg.taws = (s === 'aviation');
-  cfg.grid = (s === 'aviation');
+  cfg.grid = false;
   $('taws').checked = cfg.taws;
   $('grid').checked = cfg.grid;
   for (const b of document.querySelectorAll('[data-style]'))
     b.classList.toggle('on', b.dataset.style === s);
+}
+
+// --- runways drawn on the terrain (Garmin SVT / Dynon SynVis signature) -----
+
+let ovlKey = '';
+
+function buildRunways(force) {
+  const key = cfg.runways
+    ? mesh.origin.lat.toFixed(3) + ',' + mesh.origin.lon.toFixed(3) + ',' + cfg.range
+    : 'off';
+  if (!force && key === ovlKey) return;
+  ovlKey = key;
+
+  if (!cfg.runways) { renderer.setOverlay([], []); return; }
+
+  const mLat = mPerDegLat(mesh.origin.lat), mLon = mPerDegLon(mesh.origin.lat);
+  const tris = [], lines = [];
+  // Runway asphalt, and a bright edge outline so it reads at a distance.
+  const SC = [0.16, 0.17, 0.19, 1], EC = [0.94, 0.95, 0.97, 1];
+
+  for (const { a } of nearbyAirports(state.lat, state.lon, Math.min(cfg.range, 45000))) {
+    const ex = (a.lo - mesh.origin.lon) * mLon;
+    const ey = (a.la - mesh.origin.lat) * mLat;
+    // Sit on whichever is higher, the DEM or the published field elevation, so
+    // the strip never sinks into a hillside; +6 m keeps it above the mesh.
+    let g = dem.sample(a.la, a.lo, 0);
+    if (!(g === g)) g = a.e;
+    const z = Math.max(g, a.e) + 6 - curvatureDrop(Math.hypot(ex, ey));
+
+    for (const r of a.r) {
+      const th = r.h * Math.PI / 180;
+      const dx = Math.sin(th), dy = Math.cos(th);      // along the runway
+      const px = Math.cos(th), py = -Math.sin(th);     // across it
+      const hl = r.l / 2, hw = (r.w || 45) / 2;
+      const c = [
+        [ex + dx * hl + px * hw, ey + dy * hl + py * hw],
+        [ex + dx * hl - px * hw, ey + dy * hl - py * hw],
+        [ex - dx * hl - px * hw, ey - dy * hl - py * hw],
+        [ex - dx * hl + px * hw, ey - dy * hl + py * hw],
+      ];
+      const V = (p, col) => { tris.push(p[0], p[1], z, col[0], col[1], col[2], col[3]); };
+      V(c[0], SC); V(c[1], SC); V(c[2], SC);
+      V(c[0], SC); V(c[2], SC); V(c[3], SC);
+      for (let i = 0; i < 4; i++) {
+        const p = c[i], q = c[(i + 1) % 4];
+        lines.push(p[0], p[1], z + 1, ...EC, q[0], q[1], z + 1, ...EC);
+      }
+      // Centreline.
+      lines.push(ex - dx * hl * 0.9, ey - dy * hl * 0.9, z + 1, ...EC,
+                 ex + dx * hl * 0.9, ey + dy * hl * 0.9, z + 1, ...EC);
+    }
+  }
+  renderer.setOverlay(tris, lines);
+}
+
+function airportLabels(eye, mLat, mLon) {
+  if (!cfg.runways) return null;
+  const maxR = Math.min(cfg.range, 45000);
+  const out = [];
+  for (const { a, d } of nearbyAirports(state.lat, state.lon, maxR)) {
+    const ex = (a.lo - mesh.origin.lon) * mLon, ey = (a.la - mesh.origin.lat) * mLat;
+    let g = dem.sample(a.la, a.lo, 0);
+    if (!(g === g)) g = a.e;
+    const p = renderer.project(ex, ey, Math.max(g, a.e) - curvatureDrop(Math.hypot(ex, ey)), {});
+    if (!p.visible) continue;
+    if (p.x < -30 || p.x > hud.w + 30 || p.y < -20 || p.y > hud.h * 0.95) continue;
+    out.push({ c: a.c, d, x: p.x, y: p.y, alpha: clamp(1.25 - d / maxR, 0.4, 1) });
+    if (out.length >= 4) break;
+  }
+  return out;
 }
 
 // Project the named summits within range onto their peaks and declutter them.
@@ -278,6 +362,7 @@ function buildUi() {
   $('taws').onchange = e => { cfg.taws = e.target.checked; };
   $('grid').onchange = e => { cfg.grid = e.target.checked; };
   $('summits').onchange = e => { cfg.summits = e.target.checked; };
+  $('runways').onchange = e => { cfg.runways = e.target.checked; buildRunways(true); };
   $('hudOn').onchange = e => { hud.show = e.target.checked; };
   $('fov').oninput = e => { cfg.fov = +e.target.value; $('fovVal').textContent = cfg.fov + '°'; };
   $('altOff').oninput = e => {
@@ -379,6 +464,9 @@ async function boot() {
   makeMesh();
   preload();
   setMode('sim');
+  // Console handle for debugging (and for cross-checking the ESP32 port against
+  // this reference implementation).
+  window.SV = { cfg, state, sim, dem, get mesh() { return mesh; }, renderer, hud };
   running = true;
   requestAnimationFrame(frame);
 }

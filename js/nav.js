@@ -33,7 +33,14 @@ export const PRESETS = [
   // Default: in the Chamonix valley looking due south at the Mont Blanc massif,
   // so tan lower slopes rise to the white summits — a scenic showcase of the
   // relief style rather than sitting on top of the all-white glacier.
-  { name: 'Mont Blanc',   lat: 45.9200, lon: 6.8700,  alt: 2450, hdg: 184, gs: 55 },
+  // 3300 m works for both styles: above most of the valley walls (so SVT shows
+  // green/tan terrain with only the summits in TAWS amber/red), while still low
+  // enough that relief mode shows tan slopes rising to the snow.
+  { name: 'Mont Blanc',   lat: 45.9200, lon: 6.8700,  alt: 3300, hdg: 184, gs: 55 },
+  // Lined up on Courchevel's altiport (LFLJ) from the north-east: the classic
+  // SVT shot — a runway on a shelf with terrain all around it.
+  { name: 'Approach Courchevel', lat: 45.4300, lon: 6.6750, alt: 2450, hdg: 220, gs: 50 },
+  { name: 'Approach Annecy',  lat: 45.8850, lon: 6.0700, alt: 1250, hdg:  40, gs: 50 },
   { name: 'Vallée de Chamonix', lat: 45.9900, lon: 6.7500, alt: 2600, hdg: 215, gs: 45 },
   { name: 'Vercors / Grenoble', lat: 45.1200, lon: 5.6000, alt: 1800, hdg: 200, gs: 50 },
   { name: 'Lac d\'Annecy', lat: 45.8300, lon: 6.1700, alt: 1500, hdg: 180, gs: 45 },
