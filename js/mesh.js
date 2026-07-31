@@ -14,7 +14,7 @@
 // moved. That is exactly the structure the ESP32 software rasteriser wants —
 // see PORTING.md. Drop to ~4 levels of a 24-cell grid there.
 
-import { curvatureDrop, mPerDegLat, mPerDegLon } from './geo.js';
+import { mPerDegLat, mPerDegLon } from './geo.js';
 import { levelForDistance, levelDeg, MAX_LEVEL } from './dem.js';
 
 // Metres between DEM posts at level 0 (~BASE_DEG/64 of a degree of latitude).
@@ -40,12 +40,17 @@ export class TerrainMesh {
 
     this.positions = new Float32Array(this.vertCount * 3);
     this.normals = new Float32Array(this.vertCount * 3);
+    // Per-vertex "openness": this point's height minus a heavily smoothed
+    // height. Positive on ridges and spurs, negative in valleys and cirques.
+    // Shading it is what gives the terrain the depth a plain hillshade lacks.
+    this.ao = new Float32Array(this.vertCount);
     this._cx = new Float64Array(this.L);
     this._cy = new Float64Array(this.L);
 
     this.base = null;                       // world-frame reference lat/lon
     this.mLat = 0; this.mLon = 0;
-    this._key = '';
+    this._dirty = new Uint8Array(this.L);
+    this._first = true;
     this.origin = { lat: 0, lon: 0, valid: false };
     this.triCount = 0;
     this.buildMs = 0;
@@ -65,11 +70,26 @@ export class TerrainMesh {
   }
   _skirtV(k, edge, t) { return this.skirtBase + k * this.skirtVPL + edge * (this.m + 1) + t; }
 
-  // DEM level whose post spacing best matches this clipmap level's cell size.
+  // DEM level at least as fine as this clipmap level's cell size (floor, not
+  // round). Oversampling the DEM used to make terrain swim, but the lattice is
+  // world-anchored now — a level only ever shifts by a whole number of its own
+  // cells — so finer data is free detail with no motion artefacts.
   _demLevel(k) {
     const sk = this.s0 * (1 << k);
-    let l = Math.round(Math.log2(sk / POST0_M));
+    const l = Math.floor(Math.log2(sk / POST0_M));
     return l < 0 ? 0 : l > MAX_LEVEL ? MAX_LEVEL : l;
+  }
+
+  /** Queue exactly the DEM tiles this mesh samples around (lat, lon). */
+  prefetch(dem, lat, lon) {
+    const mLat = mPerDegLat(lat), mLon = mPerDegLon(lat);
+    let n = 0;
+    for (let k = 0; k < this.L; k++) {
+      const half = this.m * this.s0 * (1 << k) / 2;
+      const dLat = half / mLat, dLon = half / mLon;
+      n += dem.request(this._demLevel(k), lat - dLat, lon - dLon, lat + dLat, lon + dLon);
+    }
+    return n;
   }
 
   // Build the fixed topology once: filled finest level, hollow coarser rings,
@@ -131,19 +151,27 @@ export class TerrainMesh {
     const mLat = this.mLat, mLon = this.mLon, m = this.m, L = this.L;
     const eyeWX = (lon - this.base.lon) * mLon, eyeWY = (lat - this.base.lat) * mLat;
 
-    let key = '';
+    // Only the levels whose snapped centre actually moved need resampling. The
+    // finest ring snaps every few seconds, the coarse ones almost never, so a
+    // typical rebuild touches one small level instead of all of them.
+    const dirty = this._dirty;
+    let any = false;
     for (let k = 0; k < L; k++) {
       const snap = 2 * this.s0 * (1 << k);
-      this._cx[k] = Math.round(eyeWX / snap) * snap;
-      this._cy[k] = Math.round(eyeWY / snap) * snap;
-      key += this._cx[k] + ',' + this._cy[k] + ';';
+      const cx = Math.round(eyeWX / snap) * snap;
+      const cy = Math.round(eyeWY / snap) * snap;
+      dirty[k] = (force || this._first || cx !== this._cx[k] || cy !== this._cy[k]) ? 1 : 0;
+      if (dirty[k]) { this._cx[k] = cx; this._cy[k] = cy; any = true; }
     }
-    if (!force && key === this._key) return false;
-    this._key = key;
+    if (!any) return false;
+    this._first = false;
 
-    const ox = this._cx[0], oy = this._cy[0];
-    this.origin.lat = this.base.lat + oy / mLat;
-    this.origin.lon = this.base.lon + ox / mLon;
+    // Vertices are plain world-ENU metres from `base`; earth curvature is
+    // applied in the vertex shader relative to the eye, so the geometry does
+    // not depend on where the aircraft is and levels stay independently valid.
+    const ox = 0, oy = 0;
+    this.origin.lat = this.base.lat;
+    this.origin.lon = this.base.lon;
     this.origin.valid = true;
 
     // Fallback height for vertices whose DEM tile hasn't loaded yet. Holding
@@ -156,6 +184,7 @@ export class TerrainMesh {
 
     const P = this.positions, VPL = this.VPL;
     for (let k = 0; k < L; k++) {
+      if (!dirty[k]) continue;
       const sk = this.s0 * (1 << k), dl = this._demLevel(k);
       const cx = this._cx[k], cy = this._cy[k];
       let lastGood = seed;
@@ -166,58 +195,78 @@ export class TerrainMesh {
           let h = dem.sample(latv, this.base.lon + wx / mLon, dl);
           if (!(h === h)) h = lastGood; else lastGood = h;
           const o = (k * VPL + j * (m + 1) + i) * 3;
-          P[o] = lx; P[o + 1] = ly; P[o + 2] = h - curvatureDrop(Math.hypot(lx, ly));
+          P[o] = lx; P[o + 1] = ly; P[o + 2] = h;
         }
       }
+      this._computeAo(k);
+      this._computeNormalsLevel(k);
+      this._buildSkirtsLevel(k);
     }
 
-    this._computeNormals();
-    this._buildSkirts();
     this.buildMs = performance.now() - t0;
     return true;
   }
 
+  // Ridge/valley measure straight off the grid: this point's height minus the
+  // mean of its neighbours R cells away. Reusing the heights we just sampled
+  // avoids a second DEM lookup per vertex, and dividing by the kernel's own
+  // size makes it dimensionless, so every ring shades identically (otherwise
+  // the ring boundaries appear as horizontal bands).
+  _computeAo(k) {
+    const P = this.positions, AO = this.ao, m = this.m, VPL = this.VPL;
+    const R = 3, sk = this.s0 * (1 << k);
+    const inv = 1 / (0.45 * R * sk);
+    const at = (i, j) => P[(k * VPL + j * (m + 1) + i) * 3 + 2];
+    for (let j = 0; j <= m; j++) {
+      const jm = Math.max(j - R, 0), jp = Math.min(j + R, m);
+      for (let i = 0; i <= m; i++) {
+        const im = Math.max(i - R, 0), ip = Math.min(i + R, m);
+        const h = at(i, j);
+        const mean = (at(im, j) + at(ip, j) + at(i, jm) + at(i, jp)) * 0.25;
+        const a = (h - mean) * inv;
+        AO[k * VPL + j * (m + 1) + i] = a < -1 ? -1 : a > 1 ? 1 : a;
+      }
+    }
+  }
+
   // Central-difference grid normals: stable frame-to-frame (unlike face-averaged
   // normals, which flicker) and cheap.
-  _computeNormals() {
-    const P = this.positions, N = this.normals, m = this.m, VPL = this.VPL, L = this.L;
-    for (let k = 0; k < L; k++) {
-      const inv = 1 / (2 * this.s0 * (1 << k));
-      for (let j = 0; j <= m; j++) {
-        for (let i = 0; i <= m; i++) {
-          const zL = P[(k * VPL + j * (m + 1) + Math.max(i - 1, 0)) * 3 + 2];
-          const zR = P[(k * VPL + j * (m + 1) + Math.min(i + 1, m)) * 3 + 2];
-          const zD = P[(k * VPL + Math.max(j - 1, 0) * (m + 1) + i) * 3 + 2];
-          const zU = P[(k * VPL + Math.min(j + 1, m) * (m + 1) + i) * 3 + 2];
-          let nx = (zL - zR) * inv, ny = (zD - zU) * inv, nz = 1;
-          const l = Math.hypot(nx, ny, nz) || 1;
-          const o = (k * VPL + j * (m + 1) + i) * 3;
-          N[o] = nx / l; N[o + 1] = ny / l; N[o + 2] = nz / l;
-        }
+  _computeNormalsLevel(k) {
+    const P = this.positions, N = this.normals, m = this.m, VPL = this.VPL;
+    const inv = 1 / (2 * this.s0 * (1 << k));
+    for (let j = 0; j <= m; j++) {
+      for (let i = 0; i <= m; i++) {
+        const zL = P[(k * VPL + j * (m + 1) + Math.max(i - 1, 0)) * 3 + 2];
+        const zR = P[(k * VPL + j * (m + 1) + Math.min(i + 1, m)) * 3 + 2];
+        const zD = P[(k * VPL + Math.max(j - 1, 0) * (m + 1) + i) * 3 + 2];
+        const zU = P[(k * VPL + Math.min(j + 1, m) * (m + 1) + i) * 3 + 2];
+        let nx = (zL - zR) * inv, ny = (zD - zU) * inv, nz = 1;
+        const l = Math.hypot(nx, ny, nz) || 1;
+        const o = (k * VPL + j * (m + 1) + i) * 3;
+        N[o] = nx / l; N[o + 1] = ny / l; N[o + 2] = nz / l;
       }
     }
   }
 
   // Drop a short vertical skirt around each level's outer edge; the wall hides
   // any hairline crack against the next-coarser ring behind it.
-  _buildSkirts() {
-    const P = this.positions, N = this.normals, m = this.m, L = this.L;
+  _buildSkirtsLevel(k) {
+    const P = this.positions, N = this.normals, m = this.m;
     // Outward horizontal direction per edge (south,north,west,east). The skirt
     // is a vertical wall, so its normal is horizontal-outward, tilted slightly
     // down — that shades it as a recessed cliff/shadow rather than a bright
     // flat facet (copying the top vertex's up-normal made skirts flash white).
     const OUT = [[0, -1], [0, 1], [-1, 0], [1, 0]];
     const NZ = -0.45, NL = Math.hypot(1, NZ);
-    for (let k = 0; k < L; k++) {
-      const depth = Math.min(500, Math.max(80, this.s0 * (1 << k) * 2));
-      for (let edge = 0; edge < 4; edge++) {
-        const nx = OUT[edge][0] / NL, ny = OUT[edge][1] / NL, nz = NZ / NL;
-        for (let t = 0; t <= m; t++) {
-          const go = this._boundaryG(k, edge, t) * 3;
-          const so = this._skirtV(k, edge, t) * 3;
-          P[so] = P[go]; P[so + 1] = P[go + 1]; P[so + 2] = P[go + 2] - depth;
-          N[so] = nx; N[so + 1] = ny; N[so + 2] = nz;
-        }
+    const depth = Math.min(500, Math.max(80, this.s0 * (1 << k) * 2));
+    for (let edge = 0; edge < 4; edge++) {
+      const nx = OUT[edge][0] / NL, ny = OUT[edge][1] / NL, nz = NZ / NL;
+      for (let t = 0; t <= m; t++) {
+        const gi = this._boundaryG(k, edge, t), si = this._skirtV(k, edge, t);
+        const go = gi * 3, so = si * 3;
+        P[so] = P[go]; P[so + 1] = P[go + 1]; P[so + 2] = P[go + 2] - depth;
+        N[so] = nx; N[so + 1] = ny; N[so + 2] = nz;
+        this.ao[si] = this.ao[gi];
       }
     }
   }

@@ -1,7 +1,7 @@
 // main.js — wiring: sensors -> terrain mesh -> renderer + HUD.
 
-import { mPerDegLat, mPerDegLon, curvatureDrop, clamp } from './geo.js';
-import { DemCache, MAX_LEVEL, levelDeg } from './dem.js';
+import { mPerDegLat, mPerDegLon, clamp } from './geo.js';
+import { DemCache } from './dem.js';
 import { TerrainMesh, scanAhead } from './mesh.js';
 import { Renderer } from './render.js';
 import { Hud } from './hud.js';
@@ -13,9 +13,9 @@ const $ = id => document.getElementById(id);
 
 // Clipmap terrain: cells per side per level, and finest cell size (m).
 const QUALITY = {
-  low: { cells: 24, s0: 70 },
-  med: { cells: 32, s0: 45 },
-  high: { cells: 44, s0: 35 },
+  low: { cells: 32, s0: 45 },
+  med: { cells: 48, s0: 28 },
+  high: { cells: 64, s0: 20 },
 };
 
 const cfg = {
@@ -73,19 +73,13 @@ dem.onTile = () => {
   if (now - lastTileRebuild > 250) { lastTileRebuild = now; rebuildQueued = true; }
 };
 
-/** Queue every tile the current view needs, at the level it will be sampled at. */
+/**
+ * Queue exactly the tiles the mesh will sample. Asking the mesh itself (rather
+ * than guessing radii per level) keeps the fine levels to their small inner
+ * rings — important now that level 0 is ~17 m data.
+ */
 function preload() {
-  const far = cfg.range;
-  let n = 0;
-  for (let l = 0; l <= MAX_LEVEL; l++) {
-    const inner = 2500 * Math.pow(2, l - 0.5);
-    if (l > 0 && inner > far) break;
-    const r = l === MAX_LEVEL ? far : Math.min(far, 2500 * Math.pow(2, l + 0.5));
-    const dLat = r / mPerDegLat(state.lat), dLon = r / mPerDegLon(state.lat);
-    n += dem.request(l, state.lat - dLat, state.lon - dLon,
-                        state.lat + dLat, state.lon + dLon);
-  }
-  return n;
+  return mesh ? mesh.prefetch(dem, state.lat, state.lon) : 0;
 }
 
 // ---------------------------------------------------------------------------
@@ -192,8 +186,10 @@ function applyStyle(s) {
 let ovlKey = '';
 
 function buildRunways(force) {
+  // Keyed on the aircraft position (the mesh origin is now a fixed world base),
+  // rounded to ~1 km so this only regenerates as we actually travel.
   const key = cfg.runways
-    ? mesh.origin.lat.toFixed(3) + ',' + mesh.origin.lon.toFixed(3) + ',' + cfg.range
+    ? state.lat.toFixed(2) + ',' + state.lon.toFixed(2) + ',' + cfg.range
     : 'off';
   if (!force && key === ovlKey) return;
   ovlKey = key;
@@ -212,7 +208,7 @@ function buildRunways(force) {
     // the strip never sinks into a hillside; +6 m keeps it above the mesh.
     let g = dem.sample(a.la, a.lo, 0);
     if (!(g === g)) g = a.e;
-    const z = Math.max(g, a.e) + 6 - curvatureDrop(Math.hypot(ex, ey));
+    const z = Math.max(g, a.e) + 6;   // curvature is applied in the shader
 
     for (const r of a.r) {
       const th = r.h * Math.PI / 180;
@@ -248,7 +244,7 @@ function airportLabels(eye, mLat, mLon) {
     const ex = (a.lo - mesh.origin.lon) * mLon, ey = (a.la - mesh.origin.lat) * mLat;
     let g = dem.sample(a.la, a.lo, 0);
     if (!(g === g)) g = a.e;
-    const p = renderer.project(ex, ey, Math.max(g, a.e) - curvatureDrop(Math.hypot(ex, ey)), {});
+    const p = renderer.project(ex, ey, Math.max(g, a.e), {});
     if (!p.visible) continue;
     if (p.x < -30 || p.x > hud.w + 30 || p.y < -20 || p.y > hud.h * 0.95) continue;
     out.push({ c: a.c, d, x: p.x, y: p.y, alpha: clamp(1.25 - d / maxR, 0.4, 1) });
@@ -269,7 +265,7 @@ function summitLabels(eye, mLat, mLon) {
     const d = Math.hypot(dx, dy);
     if (d > maxR || d < 80) continue;
     // Place the label on the apex, curvature-dropped to match the terrain.
-    const z = s.e - curvatureDrop(Math.hypot(ex, ey));
+    const z = s.e;                    // project() applies the curvature drop
     const p = renderer.project(ex, ey, z, _lp);
     if (!p.visible) continue;
     if (p.x < -30 || p.x > hud.w + 30 || p.y < -20 || p.y > hud.h * 0.9) continue;

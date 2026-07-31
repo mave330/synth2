@@ -40,23 +40,34 @@ void main(){
 
 const TERRAIN_VS = `#version 300 es
 precision highp float;
-layout(location=0) in vec3 aPos;      // local ENU metres, z already curvature-dropped
+layout(location=0) in vec3 aPos;      // world ENU metres from the mesh base, z = true MSL
 layout(location=1) in vec3 aNrm;
+layout(location=2) in float aAo;      // height above the local smoothed terrain
 uniform mat4 uMVP;
-uniform float uFcoef;                 // 2 / log2(far + 1)
-out vec3 vPos;
+uniform vec2 uEyeXY;                  // aircraft position in the same frame
+out vec2 vWorld;
 out vec3 vNrm;
+out float vElev;
+out float vAo;
+out float vDist;
 out float vLogZ;
 void main(){
-  vPos = aPos; vNrm = aNrm;
-  gl_Position = uMVP * vec4(aPos, 1.0);
+  // Earth curvature is applied here, relative to the eye, so the mesh itself is
+  // viewpoint-independent and each clipmap level stays valid as we move.
+  vec2 d = aPos.xy - uEyeXY;
+  float dist = length(d);
+  vWorld = aPos.xy; vNrm = aNrm; vAo = aAo; vElev = aPos.z; vDist = dist;
+  gl_Position = uMVP * vec4(aPos.xy, aPos.z - dot(d, d) / 12742017.6, 1.0);
   vLogZ = 1.0 + gl_Position.w;
 }`;
 
 const TERRAIN_FS = `#version 300 es
 precision highp float;
-in vec3 vPos;
+in vec2 vWorld;
 in vec3 vNrm;
+in float vElev;
+in float vAo;
+in float vDist;
 in float vLogZ;
 
 uniform vec3  uSun;          // unit vector toward the sun, ENU
@@ -104,12 +115,23 @@ vec3 hypso(float h){
 }
 
 void main(){
-  float d  = length(vPos.xy);
-  float elev = vPos.z + (d*d)/(2.0*R_EARTH);      // undo the curvature drop
+  float d = vDist;
+  float elev = vElev;
   vec3 n = normalize(vNrm);
 
   bool peak = uStyle > 0.5;
   vec3 base = peak ? relief(elev) : hypso(elev);
+
+  // Steep ground is bare rock: pulling colour toward grey on the steep faces
+  // breaks up the flat elevation bands and reads far more like real terrain.
+  float slope = 1.0 - clamp(n.z, 0.0, 1.0);
+  base = mix(base, mix(base, vec3(0.44, 0.42, 0.41), 0.55),
+             smoothstep(0.30, 0.78, slope));
+
+  // Ambient occlusion from the ridge/valley measure: valleys sink into shadow,
+  // spurs catch light. This is most of the perceived depth.
+  float ao = clamp(vAo, -1.0, 1.0);          // already normalised, ring-invariant
+  base *= 1.0 + 0.18 * ao - 0.14 * max(-ao, 0.0);
 
   // --- TAWS bands, relative to the aircraft ------------------------------
   // Tint rather than replace: Garmin/Dynon keep the hillshade readable through
@@ -139,7 +161,7 @@ void main(){
   // The fine dark mesh Garmin/Dynon draw over synthetic terrain: it's what
   // makes slope and distance readable on an otherwise flat-shaded surface.
   if (uWire > 0.0) {
-    vec2 ll = uGeoOrigin + vec2(vPos.x / uGeoScale.x, vPos.y / uGeoScale.y);
+    vec2 ll = uGeoOrigin + vec2(vWorld.x / uGeoScale.x, vWorld.y / uGeoScale.y);
     vec2 g  = ll / uWire;
     vec2 w  = fwidth(g);
     vec2 f  = abs(fract(g - 0.5) - 0.5) / max(w, vec2(1e-6));
@@ -150,7 +172,7 @@ void main(){
 
   // --- lat/lon reference grid --------------------------------------------
   if (uGrid > 0.0) {
-    vec2 ll = uGeoOrigin + vec2(vPos.x / uGeoScale.x, vPos.y / uGeoScale.y);
+    vec2 ll = uGeoOrigin + vec2(vWorld.x / uGeoScale.x, vWorld.y / uGeoScale.y);
     vec2 g  = ll / uGrid;
     vec2 w  = fwidth(g);
     vec2 f  = abs(fract(g - 0.5) - 0.5) / max(w, vec2(1e-6));
@@ -167,6 +189,11 @@ void main(){
   float fog = 1.0 - exp(-pow(d / (uFar * fDist), fCurve));
   c = mix(c, uHorizon, clamp(fog, 0.0, 1.0));
 
+  // A touch of ordered noise: the elevation ramp and the haze both produce wide
+  // smooth gradients, which band badly on 8-bit displays.
+  float dith = fract(sin(dot(gl_FragCoord.xy, vec2(12.9898, 78.233))) * 43758.5453);
+  c += (dith - 0.5) * (1.0 / 255.0);
+
   frag = vec4(c, 1.0);
   // Logarithmic depth: keeps 60 m foreground and 45 km ridges both crisp even
   // on a 16-bit depth buffer.
@@ -180,14 +207,16 @@ precision highp float;
 layout(location=0) in vec3 aPos;
 layout(location=1) in vec4 aCol;
 uniform mat4 uMVP;
+uniform vec2 uEyeXY;
 out vec4 vCol;
 out float vLogZ;
 out float vDist;
 void main(){
-  gl_Position = uMVP * vec4(aPos, 1.0);
+  vec2 d = aPos.xy - uEyeXY;
+  vDist = length(d);
+  gl_Position = uMVP * vec4(aPos.xy, aPos.z - dot(d, d) / 12742017.6, 1.0);
   vLogZ = 1.0 + gl_Position.w;
   vCol = aCol;
-  vDist = length(aPos.xy);
 }`;
 
 const OVL_FS = `#version 300 es
@@ -261,6 +290,7 @@ export class Renderer {
     this.vao = gl.createVertexArray();
     this.vboPos = gl.createBuffer();
     this.vboNrm = gl.createBuffer();
+    this.vboAo = gl.createBuffer();
     this.ibo = gl.createBuffer();
     this.indexCount = 0;
     this.indexType = gl.UNSIGNED_SHORT;
@@ -326,6 +356,10 @@ export class Renderer {
     gl.bufferData(gl.ARRAY_BUFFER, mesh.normals, gl.DYNAMIC_DRAW);
     gl.enableVertexAttribArray(1);
     gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.vboAo);
+    gl.bufferData(gl.ARRAY_BUFFER, mesh.ao, gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(2);
+    gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 0, 0);
     if (topologyChanged || !this.indexCount) {
       gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.ibo);
       gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, gl.STATIC_DRAW);
@@ -344,6 +378,10 @@ export class Renderer {
   project(x, y, z, out) {
     out = out || {};
     const m = this.mvp;
+    // Mirror the vertex shader's eye-relative curvature drop, or labels drift
+    // off their features at range.
+    const dx = x - this._eyeX, dy = y - this._eyeY;
+    z -= (dx * dx + dy * dy) / 12742017.6;
     const cx = m[0] * x + m[4] * y + m[8] * z + m[12];
     const cy = m[1] * x + m[5] * y + m[9] * z + m[13];
     const cw = m[3] * x + m[7] * y + m[11] * z + m[15];
@@ -374,6 +412,7 @@ export class Renderer {
 
     const fov = this.fovDeg * DEG;
     perspective(this.proj, fov, aspect, 20, far * 1.3);
+    this._eyeX = state.eye[0]; this._eyeY = state.eye[1];
     viewMatrix(this.view, state.eye, state.heading, state.pitch, state.roll);
     multiply(this.mvp, this.proj, this.view);
     viewRotationInverse(this.invRot, this.view);
@@ -397,6 +436,7 @@ export class Renderer {
     gl.useProgram(this.terProg);
     gl.bindVertexArray(this.vao);
     gl.uniformMatrix4fv(this.terU['uMVP'], false, this.mvp);
+    gl.uniform2f(this.terU['uEyeXY'], state.eye[0], state.eye[1]);
     gl.uniform3f(this.terU['uSun'],
       Math.sin(az) * Math.cos(el), Math.cos(az) * Math.cos(el), Math.sin(el));
     gl.uniform1f(this.terU['uCamAlt'], state.eye[2]);
@@ -417,6 +457,7 @@ export class Renderer {
       gl.useProgram(this.ovlProg);
       gl.bindVertexArray(this.ovlVao);
       gl.uniformMatrix4fv(this.ovlU['uMVP'], false, this.mvp);
+      gl.uniform2f(this.ovlU['uEyeXY'], state.eye[0], state.eye[1]);
       gl.uniform1f(this.ovlU['uFcoef'], fcoef);
       gl.uniform1f(this.ovlU['uFar'], far);
       gl.uniform3fv(this.ovlU['uHorizon'], this.sky.horizon);

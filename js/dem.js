@@ -24,18 +24,22 @@ const NODATA = -9000;                 // anything below this is "no data"
 // last row/column of a tile coincides with the first of its neighbour: no seams.
 const N = 64;                         // cells per tile edge
 const S = N + 1;                      // samples per edge
-const BASE_DEG = 0.04;                // level-0 tile span in degrees (~4.4 km)
-export const MAX_LEVEL = 5;
+// Level-0 tile spans 0.01 deg (~1.1 km), i.e. ~17 m between elevation posts —
+// four times finer than the original 0.04. RGE ALTI is 1-25 m natively, so this
+// is real detail, not interpolation, and it's what puts gullies and ridges back
+// into the terrain. More levels keep the same far coverage.
+const BASE_DEG = 0.01;
+export const MAX_LEVEL = 7;
 
-const MAX_INFLIGHT = 6;
-const DB_NAME = 'synthvis-dem';
+const MAX_INFLIGHT = 10;
+const DB_NAME = 'synthvis-dem-v2';    // v2: tile geometry changed with BASE_DEG
 const DB_STORE = 'tiles';
 
 export function levelDeg(level) { return BASE_DEG * (1 << level); }
 
 /** Pick a DEM level whose post spacing suits terrain `d` metres away. */
 export function levelForDistance(d) {
-  const l = Math.round(Math.log2(Math.max(d, 1) / 2500));
+  const l = Math.round(Math.log2(Math.max(d, 1) / 3000));
   return l < 0 ? 0 : l > MAX_LEVEL ? MAX_LEVEL : l;
 }
 
