@@ -88,6 +88,18 @@ input[type=range]{width:100%;accent-color:var(--accent);margin:2px 0}
   background:linear-gradient(90deg,#39c6ff,#5fd6ff);color:#04222d;cursor:pointer}
 .go:active{transform:scale(.99)}
 
+/* offline download dialog */
+.modal{position:absolute;inset:0;z-index:70;display:none;align-items:center;justify-content:center;
+  padding:20px;background:rgba(3,6,11,.72);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px)}
+.modal.open{display:flex}
+.modal-card{max-width:400px;text-align:left;max-height:88vh;overflow-y:auto}
+.modal-card h2{margin:0 0 4px;font-size:22px;color:var(--accent)}
+.modal-card .sub{margin:0 0 4px;font-size:13.5px;text-align:left}
+#dlBarWrap{height:8px;border-radius:5px;background:rgba(255,255,255,.10);overflow:hidden;margin:10px 0 4px}
+#dlBar{height:100%;width:0;border-radius:5px;background:linear-gradient(90deg,#39c6ff,#5fd6ff);
+  transition:width .2s}
+#dlEst{margin:12px 0 0;color:var(--accent)}
+
 #toast{position:absolute;left:50%;bottom:calc(env(safe-area-inset-bottom) + 90px);
   transform:translateX(-50%) translateY(20px);z-index:50;background:rgba(20,26,36,.95);
   border:1px solid var(--line);color:var(--ink);padding:11px 18px;border-radius:12px;

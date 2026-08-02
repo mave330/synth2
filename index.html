@@ -91,7 +91,7 @@
     <div class="row"><label><input id="hudOn" type="checkbox" checked> Flight instruments</label></div>
 
     <label class="lbl">Offline cache</label>
-    <button id="preloadBtn" class="wide">Preload this area</button>
+    <button id="preloadBtn" class="wide">⤓ Download an area…</button>
     <button id="clearBtn" class="wide ghost">Clear cached tiles</button>
 
     <p class="fine">Elevation © IGN / Géoplateforme (RGE ALTI + SRTM). Free, no key.
@@ -109,7 +109,35 @@
         <li>Works offline once an area is cached</li>
       </ul>
       <button id="startBtn" class="go">Start ▸</button>
+      <button id="dlOpen" class="wide ghost">⤓ Download terrain for offline</button>
       <p class="fine">Best on iPhone in landscape. Add to Home Screen for full-screen.</p>
+    </div>
+  </div>
+
+  <!-- offline terrain downloader -->
+  <div id="dl" class="modal">
+    <div class="card modal-card">
+      <h2>Download terrain</h2>
+      <p class="sub">Cache the elevation for an area so it renders instantly and
+        works with no signal.</p>
+
+      <label class="lbl">Centre on</label>
+      <select id="dlWhere"></select>
+
+      <label class="lbl">Radius</label>
+      <div class="seg">
+        <button data-dlr="5000">5 km</button>
+        <button data-dlr="10000" class="on">10 km</button>
+        <button data-dlr="20000">20 km</button>
+        <button data-dlr="40000">40 km</button>
+      </div>
+
+      <p class="fine" id="dlEst">…</p>
+      <div id="dlBarWrap"><div id="dlBar"></div></div>
+      <p class="fine" id="dlMsg">Wi-Fi recommended. You can close this and fly meanwhile.</p>
+
+      <button id="dlGo" class="wide">Download</button>
+      <button id="dlClose" class="wide ghost">Close</button>
     </div>
   </div>
 

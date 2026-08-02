@@ -20,6 +20,25 @@ import { levelForDistance, levelDeg, MAX_LEVEL } from './dem.js';
 // Metres between DEM posts at level 0 (~BASE_DEG/64 of a degree of latitude).
 const POST0_M = levelDeg(0) * 111320 / 64;
 
+/**
+ * The DEM levels a clipmap of this shape samples, and the half-extent over
+ * which each is used. Standalone (no mesh instance needed) so the offline
+ * downloader can plan before the app has booted.
+ * @returns {{dl:number, half:number}[]}
+ */
+export function clipmapPlan(cells, s0, range) {
+  const m = Math.max(8, cells - (cells % 4));
+  const L = Math.min(9, Math.max(2, 1 + Math.ceil(Math.log2(Math.max(range, 1) / (m * s0)))));
+  const out = [];
+  for (let k = 0; k < L; k++) {
+    const sk = s0 * (1 << k);
+    let dl = Math.floor(Math.log2(sk / POST0_M));
+    dl = dl < 0 ? 0 : dl > MAX_LEVEL ? MAX_LEVEL : dl;
+    out.push({ dl, half: m * sk / 2 });
+  }
+  return out;
+}
+
 export class TerrainMesh {
   /**
    * @param cells  grid cells per side, per level (rounded to a multiple of 4)

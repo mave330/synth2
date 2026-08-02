@@ -2,7 +2,7 @@
 
 import { mPerDegLat, mPerDegLon, clamp } from './geo.js';
 import { DemCache } from './dem.js';
-import { TerrainMesh, scanAhead } from './mesh.js';
+import { TerrainMesh, scanAhead, clipmapPlan } from './mesh.js';
 import { Renderer } from './render.js';
 import { Hud } from './hud.js';
 import { NavState, Simulator, GpsSource, DeviceAttitude, PRESETS } from './nav.js';
@@ -294,6 +294,7 @@ function updateStatus() {
     `${fps.toFixed(0)} fps · ${mesh ? (mesh.triCount / 1000).toFixed(0) : 0}k tri · ` +
     `DEM ${s.loaded} tiles (${(s.bytes / 1048576).toFixed(1)} MB net, ${s.fromDisk} cached)` +
     (dem.pending ? ` · ${dem.pending} loading` : '') +
+    (dem.stats.throttled ? ` · ${dem.stats.throttled} throttled` : '') +
     (gps.error ? ` · GPS: ${gps.error}` : '');
 }
 
@@ -367,9 +368,9 @@ function buildUi() {
   };
 
   $('preloadBtn').onclick = () => {
-    const n = preload();
-    $('preloadBtn').textContent = n ? `queued ${n} tiles…` : 'already cached ✓';
-    setTimeout(() => { $('preloadBtn').textContent = 'Preload this area'; }, 2500);
+    $('panel').classList.remove('open');
+    $('dl').classList.add('open');
+    updateEstimate();
   };
   $('clearBtn').onclick = async () => {
     await dem.clearDisk();
@@ -378,6 +379,98 @@ function buildUi() {
   };
 
   applyStyle(cfg.style);          // sync renderer + controls to the default look
+}
+
+// --- offline terrain download ----------------------------------------------
+//
+// Plans exactly what the renderer would sample if the aircraft were anywhere
+// inside `radius`: for each clipmap ring, its DEM level over (radius + that
+// ring's half-extent). Coarse levels therefore reach far beyond the radius for
+// the horizon view, while the expensive fine levels stay tight.
+
+const TILE_BYTES = (64 + 1) * (64 + 1) * 4;
+let dlCancel = { stop: false }, dlBusy = false, dlRadius = 10000;
+
+function planDownload(lat, lon, radius) {
+  const q = QUALITY[cfg.quality];
+  const seen = new Set();
+  const jobs = [];
+  for (const { dl, half } of clipmapPlan(q.cells, q.s0, cfg.range)) {
+    const r = radius + half;
+    const dLat = r / mPerDegLat(lat), dLon = r / mPerDegLon(lat);
+    jobs.push(...dem.planTiles(dl, lat - dLat, lon - dLon, lat + dLat, lon + dLon, seen));
+  }
+  return jobs;
+}
+
+function dlCentre() {
+  const v = $('dlWhere').value;
+  if (v === 'here') return { lat: state.lat, lon: state.lon, name: 'current position' };
+  const p = PRESETS[+v];
+  return { lat: p.lat, lon: p.lon, name: p.name };
+}
+
+function updateEstimate() {
+  if (dlBusy) return;
+  const c = dlCentre();
+  const n = planDownload(c.lat, c.lon, dlRadius).length;
+  $('dlEst').textContent = n === 0
+    ? `${c.name}: already downloaded ✓`
+    : `${c.name}: ${n} tiles, about ${(n * TILE_BYTES / 1048576).toFixed(0)} MB`;
+}
+
+function buildDownloadUi() {
+  const sel = $('dlWhere');
+  const here = document.createElement('option');
+  here.value = 'here'; here.textContent = 'My current position';
+  sel.appendChild(here);
+  PRESETS.forEach((p, i) => {
+    const o = document.createElement('option');
+    o.value = i; o.textContent = p.name; sel.appendChild(o);
+  });
+  sel.onchange = updateEstimate;
+
+  for (const b of document.querySelectorAll('[data-dlr]'))
+    b.onclick = () => {
+      dlRadius = +b.dataset.dlr;
+      for (const o of document.querySelectorAll('[data-dlr]')) o.classList.toggle('on', o === b);
+      updateEstimate();
+    };
+
+  $('dlOpen').onclick = () => { $('dl').classList.add('open'); updateEstimate(); };
+  $('dlClose').onclick = () => {
+    if (dlBusy) { dlCancel.stop = true; }
+    $('dl').classList.remove('open');
+  };
+  $('dlGo').onclick = runDownload;
+}
+
+async function runDownload() {
+  if (dlBusy) {                       // second press = stop
+    dlCancel.stop = true;
+    return;
+  }
+  const c = dlCentre();
+  const jobs = planDownload(c.lat, c.lon, dlRadius);
+  if (!jobs.length) { $('dlMsg').textContent = 'Nothing to do — already cached.'; return; }
+
+  dlBusy = true; dlCancel = { stop: false };
+  $('dlGo').textContent = 'Stop';
+  const total = jobs.length;
+
+  const r = await dem.fetchArea(jobs, (done, tot, failed) => {
+    $('dlBar').style.width = (done / tot * 100).toFixed(1) + '%';
+    $('dlMsg').textContent = `${done} / ${tot} tiles` + (failed ? ` · ${failed} failed` : '');
+  }, dlCancel);
+
+  dlBusy = false;
+  $('dlGo').textContent = 'Download';
+  $('dlMsg').textContent = r.cancelled
+    ? `Stopped — ${r.done} of ${total} tiles saved (kept for offline use).`
+    : `Done: ${r.done} tiles cached` + (r.failed ? `, ${r.failed} failed` : '') + '.';
+  if (!r.cancelled && !r.failed) $('dlBar').style.width = '100%';
+  updateEstimate();
+  rebuildQueued = true;               // show the new detail straight away
 }
 
 function alertBox(msg) {
@@ -466,6 +559,9 @@ async function boot() {
   running = true;
   requestAnimationFrame(frame);
 }
+
+// The downloader is usable from the start screen, before the app boots.
+buildDownloadUi();
 
 $('startBtn').onclick = async () => {
   $('start').classList.add('gone');

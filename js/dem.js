@@ -31,9 +31,26 @@ const S = N + 1;                      // samples per edge
 const BASE_DEG = 0.01;
 export const MAX_LEVEL = 7;
 
-const MAX_INFLIGHT = 10;
+// The Géoplateforme rate-limits: push too hard and it answers 429 (and, under
+// load, stray 400s). Tiles then fail, leaving holes that show up as flat or
+// mis-shaped terrain. Keep concurrency modest and back off when asked to.
+const MAX_INFLIGHT = 6;               // live streaming while flying
+const DOWNLOAD_CONCURRENCY = 4;       // bulk offline download
+const FETCH_ATTEMPTS = 4;
 const DB_NAME = 'synthvis-dem-v2';    // v2: tile geometry changed with BASE_DEG
 const DB_STORE = 'tiles';
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+// Interruptible wait: backoff pauses can be seconds long, and a user who hits
+// Stop should not have to sit through them.
+async function sleepCancellable(ms, cancel) {
+  const end = Date.now() + ms;
+  while (Date.now() < end) {
+    if (cancel && cancel.stop) return;
+    await sleep(Math.min(200, end - Date.now()));
+  }
+}
 
 export function levelDeg(level) { return BASE_DEG * (1 << level); }
 
@@ -48,7 +65,8 @@ export class DemCache {
     this.tiles = new Map();            // key -> {data:Float32Array|null, state}
     this.queue = [];                   // pending {key, level, tx, ty, prio}
     this.inflight = 0;
-    this.stats = { loaded: 0, failed: 0, bytes: 0, fromDisk: 0 };
+    this.stats = { loaded: 0, failed: 0, bytes: 0, fromDisk: 0, throttled: 0 };
+    this._cooldownUntil = 0;
     this.onTile = null;                // callback fired when a tile lands
     this.center = { lat: 46, lon: 2 }; // used to prioritise the fetch queue
     this._db = null;
@@ -164,6 +182,59 @@ export class DemCache {
 
   get pending() { return this.queue.length + this.inflight; }
 
+  /**
+   * List the tiles of `level` covering a box that aren't already in memory.
+   * `seen` de-duplicates across several calls while building one plan.
+   */
+  planTiles(level, latMin, lonMin, latMax, lonMax, seen) {
+    const td = levelDeg(level);
+    const out = [];
+    for (let ty = Math.floor(latMin / td); ty <= Math.floor(latMax / td); ty++)
+      for (let tx = Math.floor(lonMin / td); tx <= Math.floor(lonMax / td); tx++) {
+        const key = this.key(level, tx, ty);
+        if (seen.has(key) || this.tiles.has(key)) continue;
+        seen.add(key);
+        out.push({ key, level, tx, ty });
+      }
+    return out;
+  }
+
+  /**
+   * Bulk-download a plan built with planTiles(), for offline use. Reports
+   * progress after every tile and stops promptly if `cancel.stop` is set.
+   */
+  async fetchArea(jobs, onProgress, cancel = {}) {
+    const total = jobs.length;
+    let done = 0;
+
+    // Run one pass over `list`, returning whatever failed. Concurrency is kept
+    // modest: the aim is a reliable bulk download, not a fast one.
+    const pass = async (list, countProgress) => {
+      const retry = [];
+      const next = () => list.pop();
+      const worker = async () => {
+        for (let job = next(); job && !cancel.stop; job = next()) {
+          let ok = true;
+          if (!this.tiles.has(job.key)) {
+            this.tiles.set(job.key, { data: null, state: 'queued' });
+            ok = await this._load(job, cancel);  // per-job result, not a shared counter
+          }
+          if (!ok) retry.push(job);
+          if (countProgress) { done++; if (onProgress) onProgress(done, total, retry.length); }
+        }
+      };
+      await Promise.all(new Array(DOWNLOAD_CONCURRENCY).fill(0).map(worker));
+      return retry;
+    };
+
+    let failedJobs = await pass(jobs, true);
+    if (failedJobs.length && !cancel.stop) {
+      await new Promise(r => setTimeout(r, 800));   // let a transient blip pass
+      failedJobs = await pass(failedJobs, false);
+    }
+    return { done, total, failed: failedJobs.length, cancelled: !!cancel.stop };
+  }
+
   _pump() {
     while (this.inflight < MAX_INFLIGHT && this.queue.length) {
       // Nearest-first: the terrain you are about to hit loads before the horizon.
@@ -194,16 +265,51 @@ export class DemCache {
       latMax.toFixed(7) + ',' + lonMax.toFixed(7);
   }
 
-  async _fetchGrid(layer, level, tx, ty) {
-    const r = await fetch(this._url(layer, level, tx, ty), { cache: 'force-cache' });
-    if (!r.ok) throw new Error('HTTP ' + r.status);
-    const buf = await r.arrayBuffer();
-    if (buf.byteLength !== S * S * 4) throw new Error('bad payload ' + buf.byteLength);
-    this.stats.bytes += buf.byteLength;
-    return new Float32Array(buf);      // little-endian, matches every target we care about
+  /**
+   * Fetch one grid, retrying with exponential backoff when the server pushes
+   * back. A 429 sets a shared cooldown so every worker eases off together
+   * rather than each discovering the limit on its own.
+   */
+  async _fetchGrid(layer, level, tx, ty, cancel) {
+    const url = this._url(layer, level, tx, ty);
+    let wait = 500;
+    for (let attempt = 1; ; attempt++) {
+      if (cancel && cancel.stop) throw new Error('cancelled');
+      const cool = this._cooldownUntil - Date.now();
+      if (cool > 0) await sleepCancellable(cool + Math.random() * 200, cancel);
+
+      let r;
+      try {
+        r = await fetch(url, { cache: 'force-cache' });
+      } catch (e) {
+        if (attempt >= FETCH_ATTEMPTS) throw e;         // network blip
+        await sleepCancellable(wait, cancel); wait = Math.min(wait * 2, 8000);
+        continue;
+      }
+
+      if (r.ok) {
+        const buf = await r.arrayBuffer();
+        if (buf.byteLength !== S * S * 4) throw new Error('bad payload ' + buf.byteLength);
+        this.stats.bytes += buf.byteLength;
+        return new Float32Array(buf);   // little-endian, matches every target we care about
+      }
+
+      // 429/5xx are "come back later"; a 400 under heavy load is usually the
+      // same thing wearing a different hat, so give it one chance too.
+      const retryable = r.status === 429 || r.status >= 500 || r.status === 400;
+      if (!retryable || attempt >= FETCH_ATTEMPTS) throw new Error('HTTP ' + r.status);
+
+      const ra = parseFloat(r.headers.get('Retry-After'));
+      const pause = Math.min(isFinite(ra) ? ra * 1000 : wait, 8000);
+      if (r.status === 429) this._cooldownUntil = Date.now() + pause;
+      this.stats.throttled++;
+      await sleepCancellable(pause + Math.random() * 250, cancel);
+      wait = Math.min(wait * 2, 8000);
+    }
   }
 
-  async _load(job) {
+  /** @returns {Promise<boolean>} true if the tile is now available. */
+  async _load(job, cancel) {
     const rec = this.tiles.get(job.key);
     rec.state = 'loading';
 
@@ -212,18 +318,18 @@ export class DemCache {
       rec.data = new Float32Array(cached); rec.state = 'ok';
       this.stats.loaded++; this.stats.fromDisk++;
       if (this.onTile) this.onTile(job);
-      return;
+      return true;
     }
 
     try {
-      const hi = await this._fetchGrid(LAYER_HI, job.level, job.tx, job.ty);
+      const hi = await this._fetchGrid(LAYER_HI, job.level, job.tx, job.ty, cancel);
       let holes = 0;
       for (let i = 0; i < hi.length; i++) if (hi[i] < NODATA) holes++;
 
       if (holes > 0) {
         // Outside RGE ALTI coverage: patch the holes with SRTM3.
         try {
-          const lo = await this._fetchGrid(LAYER_LO, job.level, job.tx, job.ty);
+          const lo = await this._fetchGrid(LAYER_LO, job.level, job.tx, job.ty, cancel);
           for (let i = 0; i < hi.length; i++)
             if (hi[i] < NODATA) hi[i] = lo[i] < NODATA ? 0 : lo[i];
         } catch (e) {
@@ -237,10 +343,12 @@ export class DemCache {
       this.stats.loaded++;
       this._dbPut(job.key, hi.buffer);
       if (this.onTile) this.onTile(job);
+      return true;
     } catch (e) {
       rec.state = 'error';
       this.stats.failed++;
       this.tiles.delete(job.key);       // allow a retry later
+      return false;
     }
   }
 }
