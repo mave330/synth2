@@ -8,6 +8,7 @@ import { Hud } from './hud.js';
 import { NavState, Simulator, GpsSource, DeviceAttitude, PRESETS } from './nav.js';
 import { SUMMITS, nearestSummit } from './summits.js';
 import { nearbyAirports } from './airports.js';
+import { nearbyPlaces } from './places.js';
 
 const $ = id => document.getElementById(id);
 
@@ -27,6 +28,7 @@ const cfg = {
   grid: false,
   summits: true,
   runways: true,
+  places: true,
   fov: 60,
   style: 'aviation',     // 'aviation' (Garmin/Dynon SVT) | 'relief' (PeakFinder-like)
 };
@@ -147,6 +149,7 @@ function frame(t) {
   hud.draw(state, {
     fovDeg: cfg.fov, agl: aglNow, alert, labels,
     airports: airportLabels(eye, mLat, mLon),
+    places: placeLabels(eye, mLat, mLon),
     zeroPitchHeadings: cfg.style === 'aviation',
     overflying: cfg.summits && of ? of.summit : null,
     status: cfg.mode === 'sim' ? 'SIM'
@@ -199,7 +202,9 @@ function buildRunways(force) {
   const mLat = mPerDegLat(mesh.origin.lat), mLon = mPerDegLon(mesh.origin.lat);
   const tris = [], lines = [];
   // Runway asphalt, and a bright edge outline so it reads at a distance.
-  const SC = [0.16, 0.17, 0.19, 1], EC = [0.94, 0.95, 0.97, 1];
+  // Mid grey, not near-black: a very dark fill reads as a hole punched in the
+  // terrain rather than as a runway, especially against TAWS yellow.
+  const SC = [0.34, 0.35, 0.37, 1], EC = [0.96, 0.97, 0.99, 1];
 
   for (const { a } of nearbyAirports(state.lat, state.lon, Math.min(cfg.range, 45000))) {
     const ex = (a.lo - mesh.origin.lon) * mLon;
@@ -251,6 +256,33 @@ function airportLabels(eye, mLat, mLon) {
     if (out.length >= 4) break;
   }
   return out;
+}
+
+// Towns/cities/landmarks projected onto the ground, decluttered.
+function placeLabels(eye, mLat, mLon) {
+  if (!cfg.places) return null;
+  const maxR = Math.min(cfg.range, 60000);
+  const out = [];
+  for (const { p, d } of nearbyPlaces(state.lat, state.lon, maxR)) {
+    const ex = (p.lo - mesh.origin.lon) * mLon, ey = (p.la - mesh.origin.lat) * mLat;
+    let g = dem.sample(p.la, p.lo, 0);
+    if (!(g === g)) continue;                       // no terrain here yet
+    const pr = renderer.project(ex, ey, g, {});
+    if (!pr.visible) continue;
+    if (pr.x < -40 || pr.x > hud.w + 40 || pr.y < 0 || pr.y > hud.h * 0.95) continue;
+    out.push({ n: p.n, poi: p.k === 'poi', x: pr.x, y: pr.y,
+               alpha: clamp(1.2 - d / maxR, 0.4, 1) });
+    if (out.length >= 24) break;
+  }
+  // Keep the highest-priority ones (nearbyPlaces already sorts by importance)
+  // and drop anything that would collide on screen.
+  const kept = [], minSep = Math.min(hud.w, hud.h) * 0.085;
+  for (const l of out) {
+    if (kept.length >= 7) break;
+    if (kept.some(k => Math.hypot(k.x - l.x, k.y - l.y) < minSep)) continue;
+    kept.push(l);
+  }
+  return kept;
 }
 
 // Project the named summits within range onto their peaks and declutter them.
@@ -360,6 +392,7 @@ function buildUi() {
   $('grid').onchange = e => { cfg.grid = e.target.checked; };
   $('summits').onchange = e => { cfg.summits = e.target.checked; };
   $('runways').onchange = e => { cfg.runways = e.target.checked; buildRunways(true); };
+  $('places').onchange = e => { cfg.places = e.target.checked; };
   $('hudOn').onchange = e => { hud.show = e.target.checked; };
   $('fov').oninput = e => { cfg.fov = +e.target.value; $('fovVal').textContent = cfg.fov + '°'; };
   $('altOff').oninput = e => {

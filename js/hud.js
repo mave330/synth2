@@ -51,6 +51,7 @@ export class Hud {
     this._rollScale(s);
     this._aircraft();
     this._fpm(s, opt);
+    this._places(opt.places);
     this._airports(opt.airports);
     this._summits(opt.labels);
     this._speedTape(s);
@@ -59,6 +60,37 @@ export class Hud {
     this._dataBlock(s, opt);
     this._overflying(opt.overflying);
     this._alert(opt);
+  }
+
+  // Towns, cities and landmarks on the ground. Deliberately quieter than the
+  // summit and airfield tags — this is background context, not flight data.
+  _places(list) {
+    if (!list || !list.length) return;
+    const ctx = this.ctx, u = this.u;
+    ctx.textAlign = 'left';
+    for (const p of list) {
+      ctx.globalAlpha = p.alpha;
+      const col = p.poi ? '#c9b8ff' : '#dfe7ef';
+      ctx.fillStyle = col; ctx.strokeStyle = col;
+      ctx.lineWidth = Math.max(1, 0.16 * u);
+
+      // a small open square on the spot, like a chart settlement symbol
+      const s = 0.75 * u;
+      ctx.strokeRect(p.x - s, p.y - s, s * 2, s * 2);
+
+      ctx.font = `600 ${(1.85 * u).toFixed(1)}px ui-monospace, Menlo, monospace`;
+      const w = ctx.measureText(p.n).width;
+      let bx = p.x + 1.6 * u;
+      if (bx + w > this.w - u) bx = p.x - 1.6 * u - w;   // flip inside the screen
+      ctx.globalAlpha = p.alpha * 0.55;
+      ctx.fillStyle = 'rgba(6,10,16,0.75)';
+      ctx.fillRect(bx - 0.5 * u, p.y - 1.35 * u, w + 1 * u, 2.7 * u);
+      ctx.globalAlpha = p.alpha;
+      ctx.fillStyle = col;
+      ctx.fillText(p.n, bx, p.y);
+    }
+    ctx.globalAlpha = 1;
+    ctx.font = `600 ${(2.6 * u).toFixed(1)}px ui-monospace, Menlo, monospace`;
   }
 
   // ICAO tags over the runways drawn in the 3D scene, Garmin-style cyan.

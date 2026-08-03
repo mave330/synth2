@@ -43,6 +43,7 @@ precision highp float;
 layout(location=0) in vec3 aPos;      // world ENU metres from the mesh base, z = true MSL
 layout(location=1) in vec3 aNrm;
 layout(location=2) in float aAo;      // height above the local smoothed terrain
+layout(location=3) in float aSkirt;   // LOD-seam skirt drop, 0 on real terrain
 uniform mat4 uMVP;
 uniform vec2 uEyeXY;                  // aircraft position in the same frame
 out vec2 vWorld;
@@ -56,8 +57,10 @@ void main(){
   // viewpoint-independent and each clipmap level stays valid as we move.
   vec2 d = aPos.xy - uEyeXY;
   float dist = length(d);
+  // vElev is the SURFACE elevation even for skirt vertices, so a skirt shades
+  // exactly like the terrain it hangs from and disappears if it pokes through.
   vWorld = aPos.xy; vNrm = aNrm; vAo = aAo; vElev = aPos.z; vDist = dist;
-  gl_Position = uMVP * vec4(aPos.xy, aPos.z - dot(d, d) / 12742017.6, 1.0);
+  gl_Position = uMVP * vec4(aPos.xy, aPos.z - aSkirt - dot(d, d) / 12742017.6, 1.0);
   vLogZ = 1.0 + gl_Position.w;
 }`;
 
@@ -291,6 +294,7 @@ export class Renderer {
     this.vboPos = gl.createBuffer();
     this.vboNrm = gl.createBuffer();
     this.vboAo = gl.createBuffer();
+    this.vboSkirt = gl.createBuffer();
     this.ibo = gl.createBuffer();
     this.indexCount = 0;
     this.indexType = gl.UNSIGNED_SHORT;
@@ -360,6 +364,10 @@ export class Renderer {
     gl.bufferData(gl.ARRAY_BUFFER, mesh.ao, gl.DYNAMIC_DRAW);
     gl.enableVertexAttribArray(2);
     gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.vboSkirt);
+    gl.bufferData(gl.ARRAY_BUFFER, mesh.skirt, gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(3);
+    gl.vertexAttribPointer(3, 1, gl.FLOAT, false, 0, 0);
     if (topologyChanged || !this.indexCount) {
       gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.ibo);
       gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, gl.STATIC_DRAW);

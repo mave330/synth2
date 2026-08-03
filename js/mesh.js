@@ -63,6 +63,10 @@ export class TerrainMesh {
     // height. Positive on ridges and spurs, negative in valleys and cirques.
     // Shading it is what gives the terrain the depth a plain hillshade lacks.
     this.ao = new Float32Array(this.vertCount);
+    // How far below its terrain vertex each skirt vertex hangs (0 for real
+    // terrain). Applied in the vertex shader so skirts keep the colour and
+    // shading of the surface they extend.
+    this.skirt = new Float32Array(this.vertCount);
     this._cx = new Float64Array(this.L);
     this._cy = new Float64Array(this.L);
 
@@ -269,23 +273,24 @@ export class TerrainMesh {
 
   // Drop a short vertical skirt around each level's outer edge; the wall hides
   // any hairline crack against the next-coarser ring behind it.
+  // Skirts are hidden walls that cover hairline cracks between detail rings.
+  // They must be INVISIBLE when they do peek through — so they carry the same
+  // position, normal and AO as the terrain vertex above them, and the drop is
+  // kept in a separate attribute that only the vertex shader applies. Baking
+  // the drop into z instead made the shader colour them by an elevation
+  // hundreds of metres too low, and a downward normal killed the light: the
+  // result was near-black bands flickering along the ring boundaries.
   _buildSkirtsLevel(k) {
     const P = this.positions, N = this.normals, m = this.m;
-    // Outward horizontal direction per edge (south,north,west,east). The skirt
-    // is a vertical wall, so its normal is horizontal-outward, tilted slightly
-    // down — that shades it as a recessed cliff/shadow rather than a bright
-    // flat facet (copying the top vertex's up-normal made skirts flash white).
-    const OUT = [[0, -1], [0, 1], [-1, 0], [1, 0]];
-    const NZ = -0.45, NL = Math.hypot(1, NZ);
     const depth = Math.min(500, Math.max(80, this.s0 * (1 << k) * 2));
     for (let edge = 0; edge < 4; edge++) {
-      const nx = OUT[edge][0] / NL, ny = OUT[edge][1] / NL, nz = NZ / NL;
       for (let t = 0; t <= m; t++) {
         const gi = this._boundaryG(k, edge, t), si = this._skirtV(k, edge, t);
         const go = gi * 3, so = si * 3;
-        P[so] = P[go]; P[so + 1] = P[go + 1]; P[so + 2] = P[go + 2] - depth;
-        N[so] = nx; N[so + 1] = ny; N[so + 2] = nz;
+        P[so] = P[go]; P[so + 1] = P[go + 1]; P[so + 2] = P[go + 2];
+        N[so] = N[go]; N[so + 1] = N[go + 1]; N[so + 2] = N[go + 2];
         this.ao[si] = this.ao[gi];
+        this.skirt[si] = depth;
       }
     }
   }
