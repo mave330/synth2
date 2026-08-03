@@ -67,6 +67,11 @@ export class TerrainMesh {
     // terrain). Applied in the vertex shader so skirts keep the colour and
     // shading of the surface they extend.
     this.skirt = new Float32Array(this.vertCount);
+    // 1 where the surface is exactly level over its neighbourhood. RGE ALTI
+    // stores lakes as a perfectly constant surface (a lake tile is literally
+    // one repeated value), while real ground — even flat farmland — varies by
+    // decimetres. That makes "exactly level" a dependable water mask.
+    this.water = new Float32Array(this.vertCount);
     this._cx = new Float64Array(this.L);
     this._cy = new Float64Array(this.L);
 
@@ -122,10 +127,14 @@ export class TerrainMesh {
   _buildIndices() {
     const m = this.m, L = this.L;
     const idx = [];
-    // Hole (covered by the next finer level), shrunk one cell each side so the
-    // finer ring always overlaps and never leaves a gap, even when the two
-    // levels' independent snaps differ by a cell.
-    const hlo = (m >> 2) + 1, hhi = m - (m >> 2) - 1;
+    // Hole in this ring, covered by the next finer level. Shrink it by TWO
+    // cells a side, not one: because the two levels snap independently, a
+    // one-cell shrink leaves them exactly TANGENT in the worst case (measured
+    // margin 0.00 cells). Tangent means no overlap, so along that seam the two
+    // rings — which sample different DEM levels and therefore disagree on
+    // height — leave a crack you can see the sky through. Two cells guarantees
+    // a full cell of real overlap in every snap alignment.
+    const hlo = (m >> 2) + 2, hhi = m - (m >> 2) - 2;
 
     for (let k = L - 1; k >= 0; k--) {
       for (let j = 0; j < m; j++) {
@@ -221,6 +230,7 @@ export class TerrainMesh {
           P[o] = lx; P[o + 1] = ly; P[o + 2] = h;
         }
       }
+      this._computeWater(k);
       this._computeAo(k);
       this._computeNormalsLevel(k);
       this._buildSkirtsLevel(k);
@@ -228,6 +238,24 @@ export class TerrainMesh {
 
     this.buildMs = performance.now() - t0;
     return true;
+  }
+
+  // Water mask: a vertex is water when its four neighbours sit at the same
+  // height to within 2 cm. Lakes pass at ~100%, farmland plains at ~0.1%.
+  _computeWater(k) {
+    const P = this.positions, W = this.water, m = this.m, VPL = this.VPL;
+    const TOL = 0.02;
+    const at = (i, j) => P[(k * VPL + j * (m + 1) + i) * 3 + 2];
+    for (let j = 0; j <= m; j++) {
+      const jm = Math.max(j - 1, 0), jp = Math.min(j + 1, m);
+      for (let i = 0; i <= m; i++) {
+        const im = Math.max(i - 1, 0), ip = Math.min(i + 1, m);
+        const h = at(i, j);
+        const flat = Math.abs(at(im, j) - h) <= TOL && Math.abs(at(ip, j) - h) <= TOL &&
+                     Math.abs(at(i, jm) - h) <= TOL && Math.abs(at(i, jp) - h) <= TOL;
+        W[k * VPL + j * (m + 1) + i] = flat ? 1 : 0;
+      }
+    }
   }
 
   // Ridge/valley measure straight off the grid: this point's height minus the
@@ -282,7 +310,12 @@ export class TerrainMesh {
   // result was near-black bands flickering along the ring boundaries.
   _buildSkirtsLevel(k) {
     const P = this.positions, N = this.normals, m = this.m;
-    const depth = Math.min(500, Math.max(80, this.s0 * (1 << k) * 2));
+    // Generous: the skirt must still reach when neighbouring rings disagree
+    // badly — e.g. one ring has real elevation and the next is still on the
+    // not-yet-loaded fallback, which in the Alps is easily a kilometre. A short
+    // skirt stops short and the gap shows sky. Depth costs nothing now that
+    // skirts shade like the surface they hang from.
+    const depth = Math.min(4000, Math.max(300, this.s0 * (1 << k) * 4));
     for (let edge = 0; edge < 4; edge++) {
       for (let t = 0; t <= m; t++) {
         const gi = this._boundaryG(k, edge, t), si = this._skirtV(k, edge, t);
@@ -290,6 +323,7 @@ export class TerrainMesh {
         P[so] = P[go]; P[so + 1] = P[go + 1]; P[so + 2] = P[go + 2];
         N[so] = N[go]; N[so + 1] = N[go + 1]; N[so + 2] = N[go + 2];
         this.ao[si] = this.ao[gi];
+        this.water[si] = this.water[gi];
         this.skirt[si] = depth;
       }
     }

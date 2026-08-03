@@ -44,22 +44,24 @@ layout(location=0) in vec3 aPos;      // world ENU metres from the mesh base, z 
 layout(location=1) in vec3 aNrm;
 layout(location=2) in float aAo;      // height above the local smoothed terrain
 layout(location=3) in float aSkirt;   // LOD-seam skirt drop, 0 on real terrain
+layout(location=4) in float aWater;   // 1 where the surface is a water body
 uniform mat4 uMVP;
-uniform vec2 uEyeXY;                  // aircraft position in the same frame
+uniform vec3 uEye;                    // aircraft position in the same frame
 out vec2 vWorld;
 out vec3 vNrm;
 out float vElev;
 out float vAo;
 out float vDist;
+out float vWater;
 out float vLogZ;
 void main(){
   // Earth curvature is applied here, relative to the eye, so the mesh itself is
   // viewpoint-independent and each clipmap level stays valid as we move.
-  vec2 d = aPos.xy - uEyeXY;
+  vec2 d = aPos.xy - uEye.xy;
   float dist = length(d);
   // vElev is the SURFACE elevation even for skirt vertices, so a skirt shades
   // exactly like the terrain it hangs from and disappears if it pokes through.
-  vWorld = aPos.xy; vNrm = aNrm; vAo = aAo; vElev = aPos.z; vDist = dist;
+  vWorld = aPos.xy; vNrm = aNrm; vAo = aAo; vElev = aPos.z; vDist = dist; vWater = aWater;
   gl_Position = uMVP * vec4(aPos.xy, aPos.z - aSkirt - dot(d, d) / 12742017.6, 1.0);
   vLogZ = 1.0 + gl_Position.w;
 }`;
@@ -71,9 +73,11 @@ in vec3 vNrm;
 in float vElev;
 in float vAo;
 in float vDist;
+in float vWater;
 in float vLogZ;
 
 uniform vec3  uSun;          // unit vector toward the sun, ENU
+uniform vec3  uEye;          // aircraft position, mesh frame
 uniform float uCamAlt;       // aircraft altitude, m MSL
 uniform float uFar;
 uniform float uFcoef;
@@ -125,16 +129,23 @@ void main(){
   bool peak = uStyle > 0.5;
   vec3 base = peak ? relief(elev) : hypso(elev);
 
+  // Lakes and reservoirs, flagged by the mesh where the surface is exactly
+  // level. Blended, so shorelines fade instead of showing a hard polygon edge.
+  float w = smoothstep(0.35, 0.80, vWater);
+
   // Steep ground is bare rock: pulling colour toward grey on the steep faces
   // breaks up the flat elevation bands and reads far more like real terrain.
   float slope = 1.0 - clamp(n.z, 0.0, 1.0);
   base = mix(base, mix(base, vec3(0.44, 0.42, 0.41), 0.55),
-             smoothstep(0.30, 0.78, slope));
+             smoothstep(0.30, 0.78, slope) * (1.0 - w));
 
   // Ambient occlusion from the ridge/valley measure: valleys sink into shadow,
-  // spurs catch light. This is most of the perceived depth.
+  // spurs catch light. This is most of the perceived depth. Water is a mirror,
+  // not a surface with relief, so it opts out.
   float ao = clamp(vAo, -1.0, 1.0);          // already normalised, ring-invariant
-  base *= 1.0 + 0.18 * ao - 0.14 * max(-ao, 0.0);
+  base *= 1.0 + (0.18 * ao - 0.14 * max(-ao, 0.0)) * (1.0 - w);
+
+  base = mix(base, peak ? vec3(0.50, 0.57, 0.64) : vec3(0.11, 0.24, 0.39), w);
 
   // --- TAWS bands, relative to the aircraft ------------------------------
   // Tint rather than replace: Garmin/Dynon keep the hillshade readable through
@@ -158,6 +169,19 @@ void main(){
     c = base * (0.30 * sky + 0.85 * lam);
     // Sharpen ridges a little: rim highlight on slopes facing the sun edge-on.
     c += base * 0.12 * pow(1.0 - abs(n.z), 3.0);
+  }
+
+  // --- water surface ------------------------------------------------------
+  // Water gets brighter and skyward-tinted at grazing angles (Fresnel) plus a
+  // tight sun glint, which is what makes it read as water rather than a flat
+  // grey polygon lying on the ground.
+  if (w > 0.0) {
+    vec3 V = normalize(vec3(uEye.xy - vWorld, uEye.z - elev));
+    float fres = pow(1.0 - clamp(V.z, 0.0, 1.0), 4.0);
+    vec3 skyRefl = peak ? uHorizon : mix(uHorizon, vec3(0.32, 0.52, 0.82), 0.45);
+    c = mix(c, skyRefl, (0.28 + 0.55 * fres) * w);
+    vec3 H = normalize(uSun + V);
+    c += vec3(pow(max(H.z, 0.0), 180.0) * 0.85 * w);
   }
 
   // --- SVT terrain lattice -----------------------------------------------
@@ -295,6 +319,7 @@ export class Renderer {
     this.vboNrm = gl.createBuffer();
     this.vboAo = gl.createBuffer();
     this.vboSkirt = gl.createBuffer();
+    this.vboWater = gl.createBuffer();
     this.ibo = gl.createBuffer();
     this.indexCount = 0;
     this.indexType = gl.UNSIGNED_SHORT;
@@ -368,6 +393,10 @@ export class Renderer {
     gl.bufferData(gl.ARRAY_BUFFER, mesh.skirt, gl.DYNAMIC_DRAW);
     gl.enableVertexAttribArray(3);
     gl.vertexAttribPointer(3, 1, gl.FLOAT, false, 0, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, this.vboWater);
+    gl.bufferData(gl.ARRAY_BUFFER, mesh.water, gl.DYNAMIC_DRAW);
+    gl.enableVertexAttribArray(4);
+    gl.vertexAttribPointer(4, 1, gl.FLOAT, false, 0, 0);
     if (topologyChanged || !this.indexCount) {
       gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.ibo);
       gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, gl.STATIC_DRAW);
@@ -444,7 +473,7 @@ export class Renderer {
     gl.useProgram(this.terProg);
     gl.bindVertexArray(this.vao);
     gl.uniformMatrix4fv(this.terU['uMVP'], false, this.mvp);
-    gl.uniform2f(this.terU['uEyeXY'], state.eye[0], state.eye[1]);
+    gl.uniform3f(this.terU['uEye'], state.eye[0], state.eye[1], state.eye[2]);
     gl.uniform3f(this.terU['uSun'],
       Math.sin(az) * Math.cos(el), Math.cos(az) * Math.cos(el), Math.sin(el));
     gl.uniform1f(this.terU['uCamAlt'], state.eye[2]);
