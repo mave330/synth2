@@ -27,6 +27,7 @@ in vec2 vNdc;
 uniform mat3 uInvRot;
 uniform vec2 uTan;          // tan(fov/2)*aspect, tan(fov/2)
 uniform vec3 uZenith, uHorizon, uHaze;
+uniform vec3 uSun;
 out vec4 frag;
 void main(){
   vec3 rc = normalize(vec3(vNdc.x * uTan.x, vNdc.y * uTan.y, -1.0));
@@ -35,6 +36,14 @@ void main(){
   vec3 c;
   if (z >= 0.0) c = mix(uHorizon, uZenith, pow(min(z * 1.35, 1.0), 0.6));
   else          c = mix(uHorizon, uHaze,   pow(min(-z * 4.0, 1.0), 0.7));
+
+  // Sun: a small disc plus the broad forward-scattered glow around it. Gives
+  // the sky somewhere to come from, and makes the terrain's lighting direction
+  // readable instead of arbitrary.
+  float sd = max(dot(rw, uSun), 0.0);
+  c += vec3(1.00, 0.94, 0.80) * pow(sd, 1400.0) * 1.6;
+  c += vec3(1.00, 0.88, 0.68) * pow(sd, 9.0) * 0.16;
+
   frag = vec4(c, 1.0);
 }`;
 
@@ -214,7 +223,13 @@ void main(){
   float fDist  = peak ? 0.46 : 0.62;
   float fCurve = peak ? 1.5  : 2.2;
   float fog = 1.0 - exp(-pow(d / (uFar * fDist), fCurve));
-  c = mix(c, uHorizon, clamp(fog, 0.0, 1.0));
+  // Haze scatters forward, so distance looking toward the sun is brighter and
+  // warmer than distance looking away — the cue that sells depth in real air.
+  vec3 Vf = normalize(vec3(vWorld - uEye.xy, elev - uEye.z));
+  float toSun = max(dot(Vf, uSun), 0.0);
+  vec3 hazeCol = mix(uHorizon, uHorizon * vec3(1.16, 1.10, 0.98) + 0.05,
+                     pow(toSun, 6.0) * 0.75);
+  c = mix(c, hazeCol, clamp(fog, 0.0, 1.0));
 
   // A touch of ordered noise: the elevation ramp and the haze both produce wide
   // smooth gradients, which band badly on 8-bit displays.
@@ -373,44 +388,44 @@ export class Renderer {
     gl.bufferData(gl.ARRAY_BUFFER, buf, gl.DYNAMIC_DRAW);
   }
 
-  /** Upload a rebuilt TerrainMesh. */
+  /**
+   * Upload a rebuilt TerrainMesh. Storage is allocated once and refilled with
+   * bufferSubData afterwards — bufferData reallocates the whole store every
+   * call, which is ~650 kB of churn per rebuild for no reason.
+   */
   upload(mesh, topologyChanged) {
     const gl = this.gl;
     gl.bindVertexArray(this.vao);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.vboPos);
-    gl.bufferData(gl.ARRAY_BUFFER, mesh.positions, gl.DYNAMIC_DRAW);
-    gl.enableVertexAttribArray(0);
-    gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.vboNrm);
-    gl.bufferData(gl.ARRAY_BUFFER, mesh.normals, gl.DYNAMIC_DRAW);
-    gl.enableVertexAttribArray(1);
-    gl.vertexAttribPointer(1, 3, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.vboAo);
-    gl.bufferData(gl.ARRAY_BUFFER, mesh.ao, gl.DYNAMIC_DRAW);
-    gl.enableVertexAttribArray(2);
-    gl.vertexAttribPointer(2, 1, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.vboSkirt);
-    gl.bufferData(gl.ARRAY_BUFFER, mesh.skirt, gl.DYNAMIC_DRAW);
-    gl.enableVertexAttribArray(3);
-    gl.vertexAttribPointer(3, 1, gl.FLOAT, false, 0, 0);
-    gl.bindBuffer(gl.ARRAY_BUFFER, this.vboWater);
-    gl.bufferData(gl.ARRAY_BUFFER, mesh.water, gl.DYNAMIC_DRAW);
-    gl.enableVertexAttribArray(4);
-    gl.vertexAttribPointer(4, 1, gl.FLOAT, false, 0, 0);
-    if (topologyChanged || !this.indexCount) {
+    const alloc = topologyChanged || !this._allocated;
+    const put = (vbo, arr, loc, size) => {
+      gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+      if (alloc) {
+        gl.bufferData(gl.ARRAY_BUFFER, arr, gl.DYNAMIC_DRAW);
+        gl.enableVertexAttribArray(loc);
+        gl.vertexAttribPointer(loc, size, gl.FLOAT, false, 0, 0);
+      } else {
+        gl.bufferSubData(gl.ARRAY_BUFFER, 0, arr);
+      }
+    };
+    put(this.vboPos, mesh.positions, 0, 3);
+    put(this.vboNrm, mesh.normals, 1, 3);
+    put(this.vboAo, mesh.ao, 2, 1);
+    put(this.vboSkirt, mesh.skirt, 3, 1);
+    put(this.vboWater, mesh.water, 4, 1);
+    if (alloc) {
       gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, this.ibo);
       gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, mesh.indices, gl.STATIC_DRAW);
       this.indexCount = mesh.indices.length;
       this.indexType = mesh.indices.BYTES_PER_ELEMENT === 4
         ? gl.UNSIGNED_INT : gl.UNSIGNED_SHORT;
     }
+    this._allocated = true;
     gl.bindVertexArray(null);
   }
 
   /**
-   * Project a point in the mesh's local ENU frame to CSS pixels, using the MVP
-   * from the last draw(). Returns {x, y, dist, visible}. visible is false when
-   * the point is behind the camera.
+   * Project a point in the mesh's world frame to CSS pixels, using the MVP from
+   * the last draw(). Returns {x, y, visible}; visible is false behind the eye.
    */
   project(x, y, z, out) {
     out = out || {};
@@ -464,6 +479,9 @@ export class Renderer {
     gl.uniform3fv(this.skyU['uZenith'], this.sky.zenith);
     gl.uniform3fv(this.skyU['uHorizon'], this.sky.horizon);
     gl.uniform3fv(this.skyU['uHaze'], this.sky.haze);
+    const saz = this.sunAzDeg * DEG, sel = this.sunElDeg * DEG;
+    gl.uniform3f(this.skyU['uSun'],
+      Math.sin(saz) * Math.cos(sel), Math.cos(saz) * Math.cos(sel), Math.sin(sel));
     gl.drawArrays(gl.TRIANGLES, 0, 3);
 
     gl.depthMask(true); gl.enable(gl.DEPTH_TEST); gl.clear(gl.DEPTH_BUFFER_BIT);

@@ -219,13 +219,32 @@ export class TerrainMesh {
       if (!dirty[k]) continue;
       const sk = this.s0 * (1 << k), dl = this._demLevel(k);
       const cx = this._cx[k], cy = this._cy[k];
+      // GEOMORPH: towards its outer edge a ring fades its height into what the
+      // NEXT COARSER ring samples, so by the time terrain is handed over the two
+      // already agree exactly. Without it detail visibly "steps" as a feature
+      // crosses a ring boundary. Done here rather than in the shader because the
+      // blend factor only changes when a ring snaps, so it costs nothing to draw.
+      const dlC = k < L - 1 ? this._demLevel(k + 1) : dl;
+      const morph = dlC !== dl;
+      const half = m / 2, R0 = 0.72, RW = 1 / (1 - R0);
       let lastGood = seed;
       for (let j = 0; j <= m; j++) {
         const wy = cy + (j - m / 2) * sk, ly = wy - oy, latv = this.base.lat + wy / mLat;
+        const aj = Math.abs(j - half);
         for (let i = 0; i <= m; i++) {
           const wx = cx + (i - m / 2) * sk, lx = wx - ox;
-          let h = dem.sample(latv, this.base.lon + wx / mLon, dl);
+          const lonv = this.base.lon + wx / mLon;
+          let h = dem.sample(latv, lonv, dl);
           if (!(h === h)) h = lastGood; else lastGood = h;
+          if (morph) {
+            // Chebyshev distance from the ring centre matches the square rings.
+            const u = Math.max(Math.abs(i - half), aj) / half;
+            if (u > R0) {
+              const t = Math.min((u - R0) * RW, 1);
+              const hc = dem.sample(latv, lonv, dlC);
+              if (hc === hc) h += (hc - h) * (t * t * (3 - 2 * t));
+            }
+          }
           const o = (k * VPL + j * (m + 1) + i) * 3;
           P[o] = lx; P[o + 1] = ly; P[o + 2] = h;
         }

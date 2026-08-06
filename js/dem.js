@@ -52,7 +52,10 @@ async function sleepCancellable(ms, cancel) {
   }
 }
 
-export function levelDeg(level) { return BASE_DEG * (1 << level); }
+const LEVEL_DEG = [];
+for (let l = 0; l <= MAX_LEVEL; l++) LEVEL_DEG[l] = BASE_DEG * (1 << l);
+
+export function levelDeg(level) { return LEVEL_DEG[level]; }
 
 /** Pick a DEM level whose post spacing suits terrain `d` metres away. */
 export function levelForDistance(d) {
@@ -67,6 +70,8 @@ export class DemCache {
     this.inflight = 0;
     this.stats = { loaded: 0, failed: 0, bytes: 0, fromDisk: 0, throttled: 0 };
     this._cooldownUntil = 0;
+    this._queueDirty = false;
+    this._sortLat = 0; this._sortLon = 0;
     this.onTile = null;                // callback fired when a tile lands
     this.center = { lat: 46, lon: 2 }; // used to prioritise the fetch queue
     this._db = null;
@@ -115,7 +120,14 @@ export class DemCache {
 
   // -- tile addressing ----------------------------------------------------
 
-  key(level, tx, ty) { return level + '/' + tx + '/' + ty; }
+  // Numeric key for the in-memory map: sample() runs ~18k times per rebuild and
+  // building a string each time was the single biggest source of garbage in the
+  // hot loop. Comfortably inside 2^53 for every level/tile we address.
+  key(level, tx, ty) { return (level * 262144 + (tx + 131072)) * 262144 + (ty + 131072); }
+
+  // Stable string form, used only as the IndexedDB key so tiles downloaded by
+  // earlier versions remain valid.
+  dbKey(level, tx, ty) { return level + '/' + tx + '/' + ty; }
 
   /**
    * Bilinear height at (lat, lon) from the requested level. Falls back to any
@@ -125,9 +137,9 @@ export class DemCache {
    */
   sample(lat, lon, level) {
     for (let l = level; l <= MAX_LEVEL; l++) {
-      const td = levelDeg(l);
+      const td = LEVEL_DEG[l];
       const tx = Math.floor(lon / td), ty = Math.floor(lat / td);
-      const t = this.tiles.get(this.key(l, tx, ty));
+      const t = this.tiles.get((l * 262144 + (tx + 131072)) * 262144 + (ty + 131072));
       if (t && t.data) {
         const h = this._bilinear(t.data, lat, lon, tx, ty, td);
         if (l === level) return h;
@@ -161,6 +173,7 @@ export class DemCache {
     if (this.tiles.has(key)) return;
     this.tiles.set(key, { data: null, state: 'queued' });
     this.queue.push({ key, level, tx, ty });
+    this._queueDirty = true;
     this._pump();
   }
 
@@ -174,6 +187,7 @@ export class DemCache {
         if (this.tiles.has(key)) continue;
         this.tiles.set(key, { data: null, state: 'queued' });
         this.queue.push({ key, level, tx, ty });
+        this._queueDirty = true;
         n++;
       }
     this._pump();
@@ -235,18 +249,29 @@ export class DemCache {
     return { done, total, failed: failedJobs.length, cancelled: !!cancel.stop };
   }
 
+  // Nearest-first, but sorted once per batch rather than rescanning the whole
+  // queue for every dequeue — that was O(n^2), and a few hundred queued tiles
+  // made it show. Sorted farthest-first so the nearest is a cheap pop().
+  _sortQueue() {
+    const c = this.center;
+    for (const q of this.queue) {
+      const td = LEVEL_DEG[q.level];
+      const dy = (q.ty + 0.5) * td - c.lat, dx = (q.tx + 0.5) * td - c.lon;
+      q.d = dx * dx + dy * dy + q.level * 0.02;
+    }
+    this.queue.sort((a, b) => b.d - a.d);
+    this._sortLat = c.lat; this._sortLon = c.lon;
+    this._queueDirty = false;
+  }
+
   _pump() {
     while (this.inflight < MAX_INFLIGHT && this.queue.length) {
-      // Nearest-first: the terrain you are about to hit loads before the horizon.
-      const c = this.center;
-      let bi = 0, bd = Infinity;
-      for (let i = 0; i < this.queue.length; i++) {
-        const q = this.queue[i], td = levelDeg(q.level);
-        const dy = (q.ty + 0.5) * td - c.lat, dx = (q.tx + 0.5) * td - c.lon;
-        const d = dx * dx + dy * dy + q.level * 0.02;
-        if (d < bd) { bd = d; bi = i; }
-      }
-      const job = this.queue.splice(bi, 1)[0];
+      // Re-prioritise when new work arrived or we have moved far enough that
+      // the old ordering is stale.
+      if (this._queueDirty ||
+          Math.abs(this.center.lat - this._sortLat) > 0.01 ||
+          Math.abs(this.center.lon - this._sortLon) > 0.01) this._sortQueue();
+      const job = this.queue.pop();
       this.inflight++;
       this._load(job).finally(() => { this.inflight--; this._pump(); });
     }
@@ -313,7 +338,8 @@ export class DemCache {
     const rec = this.tiles.get(job.key);
     rec.state = 'loading';
 
-    const cached = await this._dbGet(job.key);
+    const dbk = this.dbKey(job.level, job.tx, job.ty);
+    const cached = await this._dbGet(dbk);
     if (cached) {
       rec.data = new Float32Array(cached); rec.state = 'ok';
       this.stats.loaded++; this.stats.fromDisk++;
@@ -341,7 +367,7 @@ export class DemCache {
 
       rec.data = hi; rec.state = 'ok';
       this.stats.loaded++;
-      this._dbPut(job.key, hi.buffer);
+      this._dbPut(dbk, hi.buffer);
       if (this.onTile) this.onTile(job);
       return true;
     } catch (e) {

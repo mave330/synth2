@@ -121,6 +121,7 @@ function frame(t) {
 
   dem.center.lat = state.lat; dem.center.lon = state.lon;
   maybeRebuild();
+  refreshLabelCandidates(t);
 
   if (t - lastScan > 500) { lastScan = t; updateAlert(); }
 
@@ -245,7 +246,7 @@ function airportLabels(eye, mLat, mLon) {
   if (!cfg.runways) return null;
   const maxR = Math.min(cfg.range, 45000);
   const out = [];
-  for (const { a, d } of nearbyAirports(state.lat, state.lon, maxR)) {
+  for (const { a, d } of labelCache.airports) {
     const ex = (a.lo - mesh.origin.lon) * mLon, ey = (a.la - mesh.origin.lat) * mLat;
     let g = dem.sample(a.la, a.lo, 0);
     if (!(g === g)) g = a.e;
@@ -258,12 +259,40 @@ function airportLabels(eye, mLat, mLon) {
   return out;
 }
 
+// The label databases are scanned and sorted at a low rate and the survivors
+// cached: only the per-frame projection (a handful of multiplies each) has to
+// track attitude. Rescanning ~240 entries with hypot+sort every frame was pure
+// waste — the candidate set barely changes between frames.
+const labelCache = { t: -1e9, lat: 0, lon: 0, places: [], airports: [], summits: [] };
+
+function refreshLabelCandidates(now) {
+  if (now - labelCache.t < 400 &&
+      Math.abs(state.lat - labelCache.lat) < 0.004 &&
+      Math.abs(state.lon - labelCache.lon) < 0.004) return;
+  labelCache.t = now; labelCache.lat = state.lat; labelCache.lon = state.lon;
+
+  const maxP = Math.min(cfg.range, 60000);
+  labelCache.places = nearbyPlaces(state.lat, state.lon, maxP).slice(0, 24);
+  labelCache.airports = nearbyAirports(state.lat, state.lon, Math.min(cfg.range, 45000)).slice(0, 8);
+
+  const maxS = Math.min(cfg.range * 1.12, 90000);
+  const cl = Math.cos(state.lat * Math.PI / 180);
+  const near = [];
+  for (const su of SUMMITS) {
+    const dy = (su.la - state.lat) * 111320, dx = (su.lo - state.lon) * 111320 * cl;
+    const d = Math.hypot(dx, dy);
+    if (d <= maxS && d >= 80) near.push({ s: su, d });
+  }
+  near.sort((a, b) => a.d - b.d);
+  labelCache.summits = near.slice(0, 14);
+}
+
 // Towns/cities/landmarks projected onto the ground, decluttered.
 function placeLabels(eye, mLat, mLon) {
   if (!cfg.places) return null;
   const maxR = Math.min(cfg.range, 60000);
   const out = [];
-  for (const { p, d } of nearbyPlaces(state.lat, state.lon, maxR)) {
+  for (const { p, d } of labelCache.places) {
     const ex = (p.lo - mesh.origin.lon) * mLon, ey = (p.la - mesh.origin.lat) * mLat;
     let g = dem.sample(p.la, p.lo, 0);
     if (!(g === g)) continue;                       // no terrain here yet
@@ -290,22 +319,16 @@ const _lp = {};
 function summitLabels(eye, mLat, mLon) {
   const maxR = Math.min(cfg.range * 1.12, 90000);
   const out = [];
-  for (const s of SUMMITS) {
+  for (const { s, d } of labelCache.summits) {     // already range-filtered + sorted
     const ex = (s.lo - mesh.origin.lon) * mLon;
     const ey = (s.la - mesh.origin.lat) * mLat;
-    const dx = ex - eye[0], dy = ey - eye[1];
-    const d = Math.hypot(dx, dy);
-    if (d > maxR || d < 80) continue;
-    // Place the label on the apex, curvature-dropped to match the terrain.
-    const z = s.e;                    // project() applies the curvature drop
-    const p = renderer.project(ex, ey, z, _lp);
+    // Place the label on the apex; project() applies the curvature drop.
+    const p = renderer.project(ex, ey, s.e, _lp);
     if (!p.visible) continue;
     if (p.x < -30 || p.x > hud.w + 30 || p.y < -20 || p.y > hud.h * 0.9) continue;
     out.push({ n: s.n, e: s.e, d, x: p.x, y: p.y,
                alpha: clamp(1.3 - d / maxR, 0.35, 1) });
   }
-  // Nearest first, then greedily drop labels that would stack on screen.
-  out.sort((a, b) => a.d - b.d);
   const kept = [], minSep = Math.min(hud.w, hud.h) * 0.11;
   for (const l of out) {
     if (kept.length >= 6) break;
